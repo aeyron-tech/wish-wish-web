@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 
-export const maxDuration = 300;
+export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
 const BACKEND =
@@ -59,7 +59,7 @@ export async function POST(req: NextRequest) {
             message: query,
             session_id: sessionId || undefined,
           }),
-          signal: AbortSignal.timeout(280_000),
+          signal: AbortSignal.timeout(55_000),
         });
         const json = (await res.json()) as Record<string, unknown>;
         if (!res.ok) {
