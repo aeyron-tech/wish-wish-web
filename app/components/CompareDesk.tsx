@@ -39,27 +39,6 @@ const FOLLOWUPS = [
   "Prefer a single 1L carton",
 ];
 
-const API = (
-  process.env.NEXT_PUBLIC_WISHWISH_API_URL ||
-  "https://ai-6324514494074177b48dc4858456a287.ecs.us-east-1.on.aws"
-).replace(/\/$/, "");
-const TOKEN = process.env.NEXT_PUBLIC_WISHWISH_TOKEN || "test";
-
-function asOffers(products: unknown): Offer[] {
-  if (!Array.isArray(products)) return [];
-  return products.map((raw) => {
-    const p = (raw || {}) as Record<string, unknown>;
-    const price = p.price ?? p.price_sar ?? p.sale_price;
-    return {
-      site: String(p.site || ""),
-      title: String(p.name || p.title || ""),
-      price_sar: typeof price === "number" ? price : price != null ? Number(price) : null,
-      url: String(p.url || ""),
-      image_url: String(p.image || p.image_url || ""),
-    };
-  });
-}
-
 export default function CompareDesk() {
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
@@ -118,39 +97,32 @@ export default function CompareDesk() {
     };
     try {
       pushStep("Talking to Wish Wish API");
-      const res = await fetch(`${API}/v2/chat`, {
+      const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          token: TOKEN,
-          message: q,
-          session_id: sessionId || undefined,
-        }),
+        body: JSON.stringify({ query: q, session_id: sessionId }),
       });
       const json = (await res.json()) as Record<string, unknown>;
       if (!res.ok) {
-        patchTurn(id, { error: String(json.detail || json.message || "Something went wrong.") });
+        patchTurn(id, { error: String(json.error || json.detail || json.message || "Something went wrong.") });
         return;
       }
-      const data = (json.data || {}) as Record<string, unknown>;
-      const turn = (data.response || {}) as Record<string, unknown>;
-      const inner = (turn.data || {}) as Record<string, unknown>;
-      if (data.session_id) setSessionId(String(data.session_id));
-      const nextOffers = asOffers(inner.products);
+      if (json.session_id) setSessionId(String(json.session_id));
+      const nextOffers = Array.isArray(json.offers) ? (json.offers as Offer[]) : [];
       if (nextOffers.length) {
         setOffers(nextOffers);
         setActiveQuery(q);
         pushStep(`Found ${nextOffers.length} offers`);
       }
-      if (turn.action === "view_cart") {
-        const site = STORE_NAME[String(inner.site || "")] || String(inner.site || "shop");
+      if (json.action === "view_cart") {
+        const site = STORE_NAME[String(json.site || "")] || String(json.site || "shop");
         patchTurn(id, {
-          cartNote: String(turn.message || `Cart on ${site}.`),
+          cartNote: String(json.message || `Cart on ${site}.`),
           cartSite: site,
         });
         pushStep(`In the ${site} cart`);
       }
-      const answer = String(turn.message || "").trim();
+      const answer = String(json.message || "").trim();
       if (answer) patchTurn(id, { answer });
     } catch {
       patchTurn(id, { error: "Something went wrong. Please try again." });
@@ -173,7 +145,7 @@ export default function CompareDesk() {
       <header className="market-bar">
         <a
           className="wordmark"
-          href={(process.env.NEXT_PUBLIC_BASE_PATH || "") + "/"}
+          href="/"
           onClick={(e) => {
             if (searched) {
               e.preventDefault();
