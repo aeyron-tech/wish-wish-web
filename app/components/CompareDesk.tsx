@@ -39,45 +39,25 @@ const FOLLOWUPS = [
   "Prefer a single 1L carton",
 ];
 
-function describeTool(name: string, kwargs: Record<string, unknown>): string {
-  if (name === "search_groceries") {
-    const q = String(kwargs.query || "").trim();
-    return q ? `Searching shops for “${q}”` : "Searching shops";
-  }
-  if (name === "add_grocery_to_cart") {
-    const site = STORE_NAME[String(kwargs.site || "")] || String(kwargs.site || "shop");
-    return `Adding to ${site} cart`;
-  }
-  if (name === "get_order_requirements") {
-    return "Checking what each shop needs from you";
-  }
-  return name;
-}
+const API = (
+  process.env.NEXT_PUBLIC_WISHWISH_API_URL ||
+  "https://ai-6324514494074177b48dc4858456a287.ecs.us-east-1.on.aws"
+).replace(/\/$/, "");
+const TOKEN = process.env.NEXT_PUBLIC_WISHWISH_TOKEN || "test";
 
-async function readAgentStream(
-  res: Response,
-  onEvent: (ev: Record<string, unknown>) => void,
-): Promise<void> {
-  if (!res.body) throw new Error("No stream");
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const chunks = buf.split("\n\n");
-    buf = chunks.pop() || "";
-    for (const chunk of chunks) {
-      const line = chunk.split("\n").find((l) => l.startsWith("data: "));
-      if (!line) continue;
-      try {
-        onEvent(JSON.parse(line.slice(6)) as Record<string, unknown>);
-      } catch {
-        /* ignore a truncated JSON frame */
-      }
-    }
-  }
+function asOffers(products: unknown): Offer[] {
+  if (!Array.isArray(products)) return [];
+  return products.map((raw) => {
+    const p = (raw || {}) as Record<string, unknown>;
+    const price = p.price ?? p.price_sar ?? p.sale_price;
+    return {
+      site: String(p.site || ""),
+      title: String(p.name || p.title || ""),
+      price_sar: typeof price === "number" ? price : price != null ? Number(price) : null,
+      url: String(p.url || ""),
+      image_url: String(p.image || p.image_url || ""),
+    };
+  });
 }
 
 export default function CompareDesk() {
@@ -111,13 +91,6 @@ export default function CompareDesk() {
   async function runAsk(raw: string) {
     const q = raw.trim();
     if (!q || busy) return;
-    const history = turns
-      .filter((turn) => turn.answer)
-      .slice(-6)
-      .flatMap((turn) => [
-        { role: "user", content: turn.query },
-        { role: "assistant", content: turn.answer },
-      ]);
     const id = turnSeq;
     setTurnSeq((n) => n + 1);
     const next: Turn = {
@@ -144,48 +117,41 @@ export default function CompareDesk() {
       }));
     };
     try {
-      const res = await fetch("/api/agent", {
+      pushStep("Talking to Wish Wish API");
+      const res = await fetch(`${API}/v2/chat`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q, history, session_id: sessionId }),
+        body: JSON.stringify({
+          token: TOKEN,
+          message: q,
+          session_id: sessionId || undefined,
+        }),
       });
+      const json = (await res.json()) as Record<string, unknown>;
       if (!res.ok) {
-        patchTurn(id, { error: "Something went wrong. Please try again." });
+        patchTurn(id, { error: String(json.detail || json.message || "Something went wrong.") });
         return;
       }
-      await readAgentStream(res, (ev) => {
-        const type = String(ev.type || "");
-        if (type === "session" && ev.session_id) setSessionId(String(ev.session_id));
-        if (type === "status" && ev.text) pushStep(String(ev.text));
-        if (type === "tool") {
-          pushStep(describeTool(String(ev.name || ""), (ev.kwargs || {}) as Record<string, unknown>));
-        }
-        if (type === "offers" && Array.isArray(ev.offers)) {
-          setOffers(ev.offers as Offer[]);
-          setActiveQuery(q);
-        }
-        if (type === "cart") {
-          const result = (ev.result || {}) as Record<string, unknown>;
-          const site = STORE_NAME[String(result.site || "")] || String(result.site || "");
-          if (result.ok) {
-            const shot =
-              typeof result.screenshot === "string" && result.screenshot.startsWith("data:")
-                ? result.screenshot
-                : "";
-            patchTurn(id, {
-              cartNote: `Added to ${site} cart. Stopped before checkout.`,
-              cartShot: shot,
-              cartSite: site,
-            });
-            pushStep(`In the ${site} cart`);
-          } else {
-            patchTurn(id, { cartNote: String(result.error || "Could not add to cart.") });
-            pushStep("Cart add failed");
-          }
-        }
-        if (type === "answer" && ev.text) patchTurn(id, { answer: String(ev.text) });
-        if (type === "error" && ev.text) patchTurn(id, { error: String(ev.text) });
-      });
+      const data = (json.data || {}) as Record<string, unknown>;
+      const turn = (data.response || {}) as Record<string, unknown>;
+      const inner = (turn.data || {}) as Record<string, unknown>;
+      if (data.session_id) setSessionId(String(data.session_id));
+      const nextOffers = asOffers(inner.products);
+      if (nextOffers.length) {
+        setOffers(nextOffers);
+        setActiveQuery(q);
+        pushStep(`Found ${nextOffers.length} offers`);
+      }
+      if (turn.action === "view_cart") {
+        const site = STORE_NAME[String(inner.site || "")] || String(inner.site || "shop");
+        patchTurn(id, {
+          cartNote: String(turn.message || `Cart on ${site}.`),
+          cartSite: site,
+        });
+        pushStep(`In the ${site} cart`);
+      }
+      const answer = String(turn.message || "").trim();
+      if (answer) patchTurn(id, { answer });
     } catch {
       patchTurn(id, { error: "Something went wrong. Please try again." });
     } finally {
@@ -207,7 +173,7 @@ export default function CompareDesk() {
       <header className="market-bar">
         <a
           className="wordmark"
-          href="/"
+          href={(process.env.NEXT_PUBLIC_BASE_PATH || "") + "/"}
           onClick={(e) => {
             if (searched) {
               e.preventDefault();
