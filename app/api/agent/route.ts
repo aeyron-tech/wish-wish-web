@@ -24,6 +24,10 @@ function asOffers(products: unknown) {
   });
 }
 
+function timeoutMessage() {
+  return "Search timed out. Try a specific product (e.g. milk 1 litre).";
+}
+
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const query = String(body.query || body.message || "").trim();
@@ -38,12 +42,24 @@ export async function POST(req: NextRequest) {
         message: query,
         session_id: sessionId || undefined,
       }),
-      signal: AbortSignal.timeout(55_000),
+      signal: AbortSignal.timeout(58_000),
     });
-    const json = (await res.json()) as Record<string, unknown>;
-    if (!res.ok) {
+    const text = await res.text();
+    let json: Record<string, unknown> = {};
+    try {
+      json = JSON.parse(text) as Record<string, unknown>;
+    } catch {
       return Response.json(
-        { error: String((json as { detail?: unknown }).detail || json.message || `HTTP ${res.status}`) },
+        { error: res.status === 504 ? timeoutMessage() : text.slice(0, 200) || timeoutMessage() },
+        { status: res.status === 504 ? 504 : 502 },
+      );
+    }
+    if (!res.ok) {
+      const detail = String(
+        (json as { detail?: unknown }).detail || json.message || json.error || `HTTP ${res.status}`,
+      );
+      return Response.json(
+        { error: res.status === 504 ? timeoutMessage() : detail },
         { status: res.status },
       );
     }
@@ -58,9 +74,11 @@ export async function POST(req: NextRequest) {
       message: String(turn.message || "").trim(),
     });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : "Wish Wish API is not reachable.";
+    const timedOut = /timeout|aborted|504/i.test(msg);
     return Response.json(
-      { error: err instanceof Error ? err.message : "Wish Wish API is not reachable." },
-      { status: 503 },
+      { error: timedOut ? timeoutMessage() : msg },
+      { status: timedOut ? 504 : 503 },
     );
   }
 }
