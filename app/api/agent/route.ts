@@ -72,6 +72,8 @@ export async function POST(req: NextRequest) {
       action: turn.action || null,
       site: inner.site || null,
       message: String(turn.message || "").trim(),
+      clarifying: Boolean(inner.clarifying),
+      option_groups: Array.isArray(inner.option_groups) ? inner.option_groups : [],
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Wish Wish API is not reachable.";
