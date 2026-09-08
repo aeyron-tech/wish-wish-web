@@ -1,9 +1,9 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
 import "./shop.css";
 
-type Offer = {
+export type Offer = {
   site: string;
   title: string;
   price_sar: number | null;
@@ -11,7 +11,7 @@ type Offer = {
   image_url: string;
 };
 
-type ProductDetail = {
+export type ProductDetail = {
   title: string;
   description: string;
   price_sar: number | null;
@@ -19,17 +19,17 @@ type ProductDetail = {
   error: string;
 };
 
-type ClarifyOption = { id: string; label: string };
-type ClarifyGroup = {
+export type ClarifyOption = { id: string; label: string };
+export type ClarifyGroup = {
   id: string;
   title: string;
   multi: boolean;
   options: ClarifyOption[];
 };
 
-type Step = { id: number; text: string };
+export type Step = { id: number; text: string };
 
-type CartItem = {
+export type CartItem = {
   name?: string;
   qty?: number;
   price_sar?: number;
@@ -38,7 +38,7 @@ type CartItem = {
   image_url?: string;
 };
 
-type MyOrder = {
+export type MyOrder = {
   id: string;
   site: string;
   status: string;
@@ -48,20 +48,33 @@ type MyOrder = {
   updated_at?: string;
 } | null;
 
-const USER_ID_KEY = "wishwish.user_id";
-
-type Turn = {
+export type Turn = {
   id: number;
   query: string;
   steps: Step[];
   answer: string;
+  offers?: Offer[];
   cartNote: string;
   cartShot: string;
   cartSite: string;
   error: string;
   clarifying: boolean;
   optionGroups: ClarifyGroup[];
+  createdAt?: number;
 };
+
+export type ChatThread = {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  sessionId: string;
+  turns: Turn[];
+};
+
+const USER_ID_KEY = "wishwish.user_id";
+const THREADS_STORAGE_KEY = "wishwish.threads.v2";
+const ACTIVE_THREAD_ID_KEY = "wishwish.active_thread_id.v2";
 
 const STORE_NAME: Record<string, string> = {
   ninja: "Ninja",
@@ -71,22 +84,46 @@ const STORE_NAME: Record<string, string> = {
   carrefour: "Carrefour",
 };
 
-const SUGGESTIONS = ["Milk 1L", "Eggs", "What do you need from me to order?"];
-const FOLLOWUPS = [
-  "Add the cheapest 1 litre to cart",
-  "What does it need to do checkout?",
-  "Prefer a single 1L carton",
+const SUGGESTIONS = [
+  { label: "🥛 Fresh Milk 1L", prompt: "Milk 1L - find the best price" },
+  { label: "🥚 Farm Eggs (30 pack)", prompt: "Fresh eggs 30 pack lowest price" },
+  { label: "🍞 Sliced Bread", prompt: "Fresh sliced bread best deal" },
+  { label: "🛒 What do you need to order?", prompt: "What do you need from me to order groceries?" },
 ];
 
+const FOLLOWUPS = [
+  "Add the cheapest to cart",
+  "What does it need to do checkout?",
+  "Check prices at Carrefour vs Danube",
+  "Show my current cart",
+];
+
+function generateThreadId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createNewThread(initialTitle: string = "New chat"): ChatThread {
+  return {
+    id: generateThreadId(),
+    title: initialTitle,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sessionId: "",
+    turns: [],
+  };
+}
+
 export default function CompareDesk() {
-  const [query, setQuery] = useState("");
+  const [threads, setThreads] = useState<ChatThread[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string>("");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [inputQuery, setInputQuery] = useState("");
   const [busy, setBusy] = useState(false);
-  const [searched, setSearched] = useState(false);
-  const [activeQuery, setActiveQuery] = useState("");
-  const [offers, setOffers] = useState<Offer[]>([]);
-  const [turns, setTurns] = useState<Turn[]>([]);
   const [turnSeq, setTurnSeq] = useState(1);
-  const [sessionId, setSessionId] = useState("");
   const [picked, setPicked] = useState<Record<string, string[]>>({});
   const [openOffer, setOpenOffer] = useState<Offer | null>(null);
   const [detail, setDetail] = useState<ProductDetail | null>(null);
@@ -96,11 +133,19 @@ export default function CompareDesk() {
   const [cart, setCart] = useState<MyOrder>(null);
   const [cartOpen, setCartOpen] = useState(false);
   const [cartBusy, setCartBusy] = useState(false);
+  const [removingIndex, setRemovingIndex] = useState<number | null>(null);
   const [pushCursor, setPushCursor] = useState(0);
 
-  // Persist a per-browser user_id so the same person's cart survives page
-  // reloads and new chat sessions. When real login lands, swap this for the
-  // logged-in customer id from the storefront.
+  const activeThreadIdRef = useRef<string>("");
+  const threadsRef = useRef<ChatThread[]>([]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Keep refs in sync for asynchronous operations
+  activeThreadIdRef.current = activeThreadId;
+  threadsRef.current = threads;
+
+  // 1. Initialize user ID
   useEffect(() => {
     try {
       let existing = window.localStorage.getItem(USER_ID_KEY) || "";
@@ -112,10 +157,109 @@ export default function CompareDesk() {
         window.localStorage.setItem(USER_ID_KEY, existing);
       }
       setUserId(existing);
+    } catch {}
+  }, []);
+
+  // 2. Load threads from localStorage on initial render
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(THREADS_STORAGE_KEY);
+      let parsedThreads: ChatThread[] = [];
+      if (stored) {
+        try {
+          parsedThreads = JSON.parse(stored);
+        } catch {
+          parsedThreads = [];
+        }
+      }
+
+      if (!Array.isArray(parsedThreads) || parsedThreads.length === 0) {
+        const fresh = createNewThread();
+        parsedThreads = [fresh];
+      }
+
+      let activeId = window.localStorage.getItem(ACTIVE_THREAD_ID_KEY) || "";
+      if (!activeId || !parsedThreads.some((t) => t.id === activeId)) {
+        activeId = parsedThreads[0].id;
+      }
+
+      setThreads(parsedThreads);
+      setActiveThreadId(activeId);
+      activeThreadIdRef.current = activeId;
+      threadsRef.current = parsedThreads;
+
+      let maxId = 1;
+      for (const t of parsedThreads) {
+        for (const turn of t.turns) {
+          if (turn.id >= maxId) maxId = turn.id + 1;
+        }
+      }
+      setTurnSeq(maxId);
     } catch {
-      // localStorage may be unavailable (private mode) — anonymous session is fine.
+      const fresh = createNewThread();
+      setThreads([fresh]);
+      setActiveThreadId(fresh.id);
+      activeThreadIdRef.current = fresh.id;
+      threadsRef.current = [fresh];
     }
   }, []);
+
+  // Active thread computations
+  const effectiveActiveId = activeThreadId || (threads[0]?.id ?? "");
+  const activeThread = threads.find((t) => t.id === effectiveActiveId) || threads[0];
+  const activeTurns = activeThread?.turns || [];
+  const sessionId = activeThread?.sessionId || "";
+
+  // Helper to persist updated threads cleanly
+  const updateAndPersistThreads = (
+    updater: (prev: ChatThread[]) => ChatThread[],
+    newActiveId?: string,
+  ) => {
+    setThreads((prev) => {
+      const next = updater(prev);
+      threadsRef.current = next;
+      try {
+        window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+
+    if (newActiveId !== undefined) {
+      setActiveThreadId(newActiveId);
+      activeThreadIdRef.current = newActiveId;
+      try {
+        window.localStorage.setItem(ACTIVE_THREAD_ID_KEY, newActiveId);
+      } catch {}
+    }
+  };
+
+  // Scroll to bottom when turns update or bot is busy
+  useEffect(() => {
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [activeTurns, busy]);
+
+  // Adjust textarea height dynamically
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`;
+    }
+  }, [inputQuery]);
+
+  // Close modals on Escape
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (openOffer) closeDetail();
+        if (cartOpen) setCartOpen(false);
+        if (mobileSidebarOpen) setMobileSidebarOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openOffer, cartOpen, mobileSidebarOpen]);
 
   async function refreshCart() {
     if (!userId && !sessionId) return;
@@ -139,104 +283,223 @@ export default function CompareDesk() {
     }
   }
 
-  function resetHome() {
-    setSearched(false);
-    setOffers([]);
-    setQuery("");
-    setActiveQuery("");
-    setTurns([]);
-    setSessionId("");
+  async function removeCartItem(item: CartItem, index: number) {
+    if ((!userId && !sessionId) || removingIndex !== null) return;
+    setRemovingIndex(index);
+    try {
+      const qs = new URLSearchParams();
+      if (userId) qs.set("user_id", userId);
+      if (sessionId) qs.set("session_id", sessionId);
+      if (item.product_url) qs.set("product_url", item.product_url);
+      if (item.name) qs.set("name", item.name);
+      qs.set("index", String(index));
+
+      const res = await fetch(`/api/cart?${qs.toString()}`, {
+        method: "DELETE",
+      });
+      const json = (await res.json()) as Record<string, unknown>;
+      if (res.ok && json.data) {
+        const updated = json.data as MyOrder;
+        setCart(updated && updated.id ? updated : null);
+      } else {
+        await refreshCart();
+      }
+    } catch {
+      await refreshCart();
+    } finally {
+      setRemovingIndex(null);
+    }
+  }
+
+  function handleCreateNewThread() {
+    const fresh = createNewThread();
+    updateAndPersistThreads((prev) => [fresh, ...prev], fresh.id);
+    setInputQuery("");
     setPicked({});
-    setCart(null);
-    setCartOpen(false);
-    closeDetail();
+    setMobileSidebarOpen(false);
   }
 
-  function closeDetail() {
-    setOpenOffer(null);
-    setDetail(null);
-    setDetailBusy(false);
+  function handleSelectThread(id: string) {
+    setActiveThreadId(id);
+    activeThreadIdRef.current = id;
+    setPicked({});
+    setMobileSidebarOpen(false);
+    try {
+      window.localStorage.setItem(ACTIVE_THREAD_ID_KEY, id);
+    } catch {}
   }
 
-  function patchTurn(id: number, patch: Partial<Turn> | ((prev: Turn) => Turn)) {
-    setTurns((prev) =>
-      prev.map((turn) => {
-        if (turn.id !== id) return turn;
-        return typeof patch === "function" ? patch(turn) : { ...turn, ...patch };
-      }),
-    );
+  function handleDeleteThread(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    updateAndPersistThreads((prev) => {
+      const remaining = prev.filter((t) => t.id !== id);
+      if (remaining.length === 0) {
+        const fresh = createNewThread();
+        setActiveThreadId(fresh.id);
+        activeThreadIdRef.current = fresh.id;
+        try {
+          window.localStorage.setItem(ACTIVE_THREAD_ID_KEY, fresh.id);
+        } catch {}
+        return [fresh];
+      }
+      const nextActiveId = activeThreadIdRef.current === id ? remaining[0].id : activeThreadIdRef.current;
+      setActiveThreadId(nextActiveId);
+      activeThreadIdRef.current = nextActiveId;
+      try {
+        window.localStorage.setItem(ACTIVE_THREAD_ID_KEY, nextActiveId);
+      } catch {}
+      return remaining;
+    });
+  }
+
+  function patchActiveTurn(id: number, patch: Partial<Turn> | ((prev: Turn) => Turn)) {
+    const targetThreadId = activeThreadIdRef.current;
+    setThreads((prevThreads) => {
+      const nextThreads = prevThreads.map((t) => {
+        if (t.id !== targetThreadId) return t;
+        const nextTurns = t.turns.map((turn) => {
+          if (turn.id !== id) return turn;
+          return typeof patch === "function" ? patch(turn) : { ...turn, ...patch };
+        });
+        return { ...t, turns: nextTurns, updatedAt: Date.now() };
+      });
+      threadsRef.current = nextThreads;
+      try {
+        window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(nextThreads));
+      } catch {}
+      return nextThreads;
+    });
   }
 
   async function runAsk(raw: string) {
     const q = raw.trim();
     if (!q || busy) return;
+
+    const currentThreadId = activeThreadIdRef.current || threads[0]?.id;
+    if (!currentThreadId) return;
+
     const id = turnSeq;
     setTurnSeq((n) => n + 1);
-    const next: Turn = {
+
+    const nextTurn: Turn = {
       id,
       query: q,
       steps: [],
       answer: "",
+      offers: [],
       cartNote: "",
       cartShot: "",
       cartSite: "",
       error: "",
       clarifying: false,
       optionGroups: [],
+      createdAt: Date.now(),
     };
-    setTurns((prev) => [...prev, next]);
-    setQuery("");
+
+    // Append turn immediately using functional update
+    let currentSessionId = "";
+    setThreads((prevThreads) => {
+      const nextThreads = prevThreads.map((t) => {
+        if (t.id !== currentThreadId) return t;
+        currentSessionId = t.sessionId;
+        const isNew = t.turns.length === 0 || t.title === "New chat";
+        const newTitle = isNew
+          ? q.length > 28
+            ? `${q.slice(0, 28).trim()}…`
+            : q
+          : t.title;
+        return {
+          ...t,
+          title: newTitle,
+          turns: [...t.turns, nextTurn],
+          updatedAt: Date.now(),
+        };
+      });
+      threadsRef.current = nextThreads;
+      try {
+        window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(nextThreads));
+      } catch {}
+      return nextThreads;
+    });
+
+    setInputQuery("");
     setBusy(true);
-    setSearched(true);
-    let stepId = 1;
+
+    let stepCounter = 1;
     const pushStep = (text: string) => {
-      const sid = stepId;
-      stepId += 1;
-      patchTurn(id, (turn) => ({
+      const sid = stepCounter++;
+      patchActiveTurn(id, (turn) => ({
         ...turn,
         steps: [...turn.steps, { id: sid, text }],
       }));
     };
+
     try {
-      pushStep("Talking to Wish Wish API");
+      pushStep("Searching live Riyadh stores (Ninja, Tamimi, Panda, Danube, Carrefour)…");
       const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q, session_id: sessionId, user_id: userId }),
+        body: JSON.stringify({
+          query: q,
+          session_id: currentSessionId || undefined,
+          user_id: userId,
+        }),
       });
+
       const json = (await res.json()) as Record<string, unknown>;
+
       if (!res.ok) {
-        patchTurn(id, { error: String(json.error || json.detail || json.message || "Something went wrong.") });
+        patchActiveTurn(id, {
+          error: String(json.error || json.detail || json.message || "Something went wrong."),
+        });
         return;
       }
-      if (json.session_id) setSessionId(String(json.session_id));
+
+      if (json.session_id) {
+        const sid = String(json.session_id);
+        setThreads((prevThreads) => {
+          const nextThreads = prevThreads.map((t) =>
+            t.id === currentThreadId ? { ...t, sessionId: sid } : t,
+          );
+          threadsRef.current = nextThreads;
+          try {
+            window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(nextThreads));
+          } catch {}
+          return nextThreads;
+        });
+      }
+
       const nextOffers = Array.isArray(json.offers) ? (json.offers as Offer[]) : [];
       if (nextOffers.length) {
-        setOffers(nextOffers);
-        setActiveQuery(q);
-        pushStep(`Found ${nextOffers.length} offers`);
+        pushStep(`Found ${nextOffers.length} offers with live prices`);
+        patchActiveTurn(id, { offers: nextOffers });
       }
+
       if (json.action === "view_cart") {
         const site = STORE_NAME[String(json.site || "")] || String(json.site || "shop");
-        patchTurn(id, {
+        patchActiveTurn(id, {
           cartNote: String(json.message || `Cart on ${site}.`),
           cartSite: site,
         });
         pushStep(`In the ${site} cart`);
         void refreshCart();
       }
+
       const groups = Array.isArray(json.option_groups)
         ? (json.option_groups as ClarifyGroup[])
         : [];
       if (json.clarifying && groups.length) {
         setPicked({});
-        patchTurn(id, { clarifying: true, optionGroups: groups });
-        pushStep("Pick options, then search");
+        patchActiveTurn(id, { clarifying: true, optionGroups: groups });
+        pushStep("Pick preferred options to narrow search");
       }
+
       const answer = String(json.message || "").trim();
-      if (answer) patchTurn(id, { answer });
+      if (answer) {
+        patchActiveTurn(id, { answer });
+      }
     } catch {
-      patchTurn(id, { error: "Something went wrong. Please try again." });
+      patchActiveTurn(id, { error: "Something went wrong. Please try again." });
     } finally {
       setBusy(false);
     }
@@ -244,7 +507,14 @@ export default function CompareDesk() {
 
   function onSubmit(e: FormEvent) {
     e.preventDefault();
-    void runAsk(query);
+    void runAsk(inputQuery);
+  }
+
+  function handleKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void runAsk(inputQuery);
+    }
   }
 
   function toggleOption(group: ClarifyGroup, optionId: string) {
@@ -285,6 +555,12 @@ export default function CompareDesk() {
     void runAsk(q);
   }
 
+  function closeDetail() {
+    setOpenOffer(null);
+    setDetail(null);
+    setDetailBusy(false);
+  }
+
   async function showOffer(offer: Offer) {
     setOpenOffer(offer);
     const cached = detailCache[offer.url];
@@ -312,9 +588,6 @@ export default function CompareDesk() {
         image_url: String(json.image_url || offer.image_url || ""),
         error: res.ok ? "" : String(json.error || json.message || "Could not load details."),
       };
-      if (res.ok && !next.description && !next.error) {
-        next.error = "";
-      }
       setDetailCache((prev) => ({ ...prev, [offer.url]: next }));
       setDetail(next);
     } catch {
@@ -330,15 +603,10 @@ export default function CompareDesk() {
     }
   }
 
-  const showHome = !searched && !busy;
-  const lastError = turns.at(-1)?.error || "";
-  const lastTurn = turns.at(-1);
+  const lastTurn = activeTurns.at(-1);
   const clarifying = Boolean(lastTurn?.clarifying && lastTurn.optionGroups.length);
-  const hasAnswer = turns.some((turn) => turn.answer || turn.cartNote);
 
   // Poll for agent-pushed messages (rider called, on the way, delivered)
-  // while an order is active. Each new push lands in the thread as an agent
-  // turn — same look and feel as any other assistant reply.
   useEffect(() => {
     if (!userId && !sessionId) return;
     const active = Boolean(
@@ -363,31 +631,47 @@ export default function CompareDesk() {
           if (typeof data.cursor === "number") setPushCursor(data.cursor);
           return;
         }
-        setTurns((prev) => {
-          let next = turnSeq;
-          const additions = messages.map((m) => {
-            const id = next++;
-            return {
-              id,
-              query: "",
-              steps: [],
-              answer: String(m.text || ""),
-              cartNote: "",
-              cartShot: "",
-              cartSite: "",
-              error: "",
-              clarifying: false,
-              optionGroups: [],
-            } as Turn;
-          });
-          setTurnSeq(next);
-          return [...prev, ...additions];
+
+        let nextSeq = turnSeq;
+        const additions: Turn[] = messages.map((m) => {
+          const id = nextSeq++;
+          return {
+            id,
+            query: "",
+            steps: [],
+            answer: String(m.text || ""),
+            offers: [],
+            cartNote: "",
+            cartShot: "",
+            cartSite: "",
+            error: "",
+            clarifying: false,
+            optionGroups: [],
+            createdAt: Date.now(),
+          };
         });
+        setTurnSeq(nextSeq);
+
+        const currentTargetId = activeThreadIdRef.current;
+        setThreads((prevThreads) => {
+          const nextThreads = prevThreads.map((t) => {
+            if (t.id !== currentTargetId) return t;
+            return {
+              ...t,
+              turns: [...t.turns, ...additions],
+              updatedAt: Date.now(),
+            };
+          });
+          threadsRef.current = nextThreads;
+          try {
+            window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(nextThreads));
+          } catch {}
+          return nextThreads;
+        });
+
         if (typeof data.cursor === "number") setPushCursor(data.cursor);
         void refreshCart();
-      } catch {
-        // network hiccup — next tick will retry
-      }
+      } catch {}
     };
     void tick();
     const handle = window.setInterval(tick, 6000);
@@ -395,240 +679,463 @@ export default function CompareDesk() {
       cancelled = true;
       window.clearInterval(handle);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, sessionId, cart?.status, pushCursor]);
+  }, [userId, sessionId, cart?.status, pushCursor, turnSeq]);
 
-  useEffect(() => {
-    if (!openOffer) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeDetail();
-    };
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", onKey);
-    return () => {
-      document.body.style.overflow = "";
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [openOffer]);
+  // Group threads chronologically
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = startOfToday - 86400000;
+  const startOf7Days = startOfToday - 7 * 86400000;
+
+  const groupedThreads: { label: string; items: ChatThread[] }[] = [
+    { label: "Today", items: [] },
+    { label: "Yesterday", items: [] },
+    { label: "Previous 7 days", items: [] },
+    { label: "Older", items: [] },
+  ];
+
+  for (const t of threads) {
+    const time = t.updatedAt || t.createdAt;
+    if (time >= startOfToday) {
+      groupedThreads[0].items.push(t);
+    } else if (time >= startOfYesterday) {
+      groupedThreads[1].items.push(t);
+    } else if (time >= startOf7Days) {
+      groupedThreads[2].items.push(t);
+    } else {
+      groupedThreads[3].items.push(t);
+    }
+  }
+
+  const nonEmptyGroups = groupedThreads.filter((g) => g.items.length > 0);
 
   return (
-    <div className={`market ${showHome ? "is-home" : "is-results"}`}>
-      <header className="market-bar">
-        <a
-          className="wordmark"
-          href="/"
-          onClick={(e) => {
-            if (searched) {
-              e.preventDefault();
-              resetHome();
-            }
-          }}
-        >
-          Wish <span>Wish</span>
-        </a>
-        {!showHome && (
-          <form className="search search-bar" onSubmit={onSubmit}>
-            <SearchIcon />
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask a follow-up, or search again…"
-              disabled={busy}
-            />
-            <button type="submit" disabled={busy || !query.trim()}>
-              {busy ? "Working" : "Go"}
-            </button>
-          </form>
-        )}
-        <button
-          type="button"
-          className="cart-chip"
-          onClick={() => {
-            const next = !cartOpen;
-            setCartOpen(next);
-            if (next) void refreshCart();
-          }}
-          aria-label="My cart"
-        >
-          My cart
-          {cart && cart.items?.length ? (
-            <span className="cart-chip-count">{cart.items.length}</span>
-          ) : null}
-        </button>
-      </header>
-
-      {showHome && (
-        <section className="hero">
-          <p className="eyebrow">Riyadh · live shop prices · COD</p>
-          <h1>Find it. Compare it. Pick the best price.</h1>
-          <p className="hero-lead">
-            We search Ninja, Tamimi, Panda, Danube, and Carrefour, then you pick. Click a card for the shop description.
-          </p>
-          <form className="search search-hero" onSubmit={onSubmit}>
-            <SearchIcon />
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="What do you need today?"
-              disabled={busy}
-              autoFocus
-            />
-            <button type="submit" disabled={busy || !query.trim()}>
-              Compare
-            </button>
-          </form>
-          <div className="suggest">
-            {SUGGESTIONS.map((item) => (
-              <button key={item} type="button" onClick={() => void runAsk(item)}>
-                {item}
-              </button>
-            ))}
-          </div>
-          <p className="stores">Ninja · Tamimi · Panda · Danube · Carrefour</p>
-        </section>
+    <div className="chat-app-root">
+      {/* Mobile sidebar backdrop */}
+      {mobileSidebarOpen && (
+        <div
+          className="chat-mobile-backdrop"
+          onClick={() => setMobileSidebarOpen(false)}
+          aria-hidden="true"
+        />
       )}
 
-      {!showHome && (
-        <section className="shelf">
-          {turns.length > 0 && (
-            <div className="thread">
-              {turns.map((turn, i) => (
-                <article key={turn.id} className="agent">
-                  {turn.query && <p className="agent-ask">{turn.query}</p>}
-                  <div className="agent-steps">
-                    {turn.steps.map((step) => (
-                      <span key={`${turn.id}-step-${step.id}`} className="agent-step">
-                        {step.text}
-                      </span>
-                    ))}
-                    {busy && i === turns.length - 1 && (
-                      <span className="agent-step is-live">Working…</span>
-                    )}
-                  </div>
-                  {turn.cartNote && <p className="agent-cart">{turn.cartNote}</p>}
-                  {turn.cartShot && (
-                    <figure className="agent-shot">
-                      <div className="agent-shot-frame">
-                        <img src={turn.cartShot} alt={`Cart on ${turn.cartSite || "the shop"} after add`} />
-                      </div>
-                      <figcaption>
-                        {turn.cartSite || "Shop"} cart · no checkout
-                      </figcaption>
-                    </figure>
-                  )}
-                  {turn.answer && <p className="agent-answer">{turn.answer}</p>}
-                  {turn.error && <p className="agent-error">{turn.error}</p>}
-                </article>
-              ))}
-            </div>
-          )}
+      {/* Sidebar (ChatGPT style) */}
+      <aside className={`chat-sidebar ${sidebarOpen ? "is-open" : "is-collapsed"} ${mobileSidebarOpen ? "is-mobile-open" : ""}`}>
+        <div className="chat-sidebar-header">
+          <button
+            type="button"
+            className="new-chat-btn"
+            onClick={handleCreateNewThread}
+            aria-label="Start new chat"
+          >
+            <PlusIcon />
+            <span>New chat</span>
+          </button>
+          <button
+            type="button"
+            className="sidebar-collapse-btn"
+            onClick={() => {
+              setSidebarOpen(!sidebarOpen);
+              setMobileSidebarOpen(false);
+            }}
+            title={sidebarOpen ? "Close sidebar" : "Open sidebar"}
+            aria-label="Toggle sidebar"
+          >
+            <SidebarToggleIcon />
+          </button>
+        </div>
 
-          {clarifying && lastTurn && (
-            <div className="clarify">
-              {lastTurn.optionGroups.map((group) => (
-                <div key={group.id} className="clarify-group">
-                  <p>
-                    {group.title}
-                    {group.multi ? <span> · pick several</span> : <span> · pick one</span>}
-                  </p>
-                  <div className="clarify-chips">
-                    {group.options.map((opt) => {
-                      const on = (picked[group.id] || []).includes(opt.id);
-                      return (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          className={on ? "is-on" : ""}
-                          disabled={busy}
-                          onClick={() => toggleOption(group, opt.id)}
-                        >
-                          {opt.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
+        <div className="chat-sidebar-threads">
+          {nonEmptyGroups.map((group) => (
+            <div key={group.label} className="threads-group">
+              <span className="threads-group-label">{group.label}</span>
+              <ul className="threads-list">
+                {group.items.map((t) => {
+                  const isActive = t.id === effectiveActiveId;
+                  return (
+                    <li key={t.id} className={`thread-item ${isActive ? "is-active" : ""}`}>
+                      <button
+                        type="button"
+                        className="thread-select-btn"
+                        onClick={() => handleSelectThread(t.id)}
+                      >
+                        <ChatBubbleIcon />
+                        <span className="thread-title">{t.title}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="thread-delete-btn"
+                        onClick={(e) => handleDeleteThread(t.id, e)}
+                        title="Delete chat"
+                        aria-label={`Delete chat ${t.title}`}
+                      >
+                        <TrashIcon />
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+        </div>
+
+        <div className="chat-sidebar-footer">
+          <div className="sidebar-badge-stores">
+            <span className="live-dot" />
+            <span>Ninja · Tamimi · Panda · Danube</span>
+          </div>
+          <div className="sidebar-user-info">
+            <span className="user-id-label">Session ID: {userId ? `${userId.slice(0, 11)}…` : "Anonymous"}</span>
+          </div>
+        </div>
+      </aside>
+
+      {/* Main Chat Workspace */}
+      <main className="chat-main-area">
+        {/* Top bar header */}
+        <header className="chat-topbar">
+          <div className="topbar-left">
+            {!sidebarOpen && (
               <button
                 type="button"
-                className="clarify-go"
-                disabled={busy}
-                onClick={() => searchFromPicks(lastTurn.optionGroups)}
+                className="topbar-icon-btn"
+                onClick={() => setSidebarOpen(true)}
+                title="Open sidebar"
+                aria-label="Open sidebar"
               >
-                Search shops
+                <SidebarToggleIcon />
               </button>
+            )}
+            <button
+              type="button"
+              className="topbar-icon-btn mobile-menu-btn"
+              onClick={() => setMobileSidebarOpen(true)}
+              aria-label="Open threads menu"
+            >
+              <MenuIcon />
+            </button>
+            <div className="topbar-wordmark">
+              Wish <span>Wish</span>
             </div>
-          )}
+          </div>
 
-          {!busy && !clarifying && turns.length > 0 && (
-            <div className="suggest followups">
-              {FOLLOWUPS.map((item) => (
-                <button key={item} type="button" onClick={() => void runAsk(item)}>
-                  {item}
-                </button>
-              ))}
-            </div>
-          )}
+          <div className="topbar-center">
+            <span className="active-thread-heading" title={activeThread?.title}>
+              {activeThread?.title || "New chat"}
+            </span>
+          </div>
 
-          {busy && offers.length === 0 && !clarifying && (
-            <div className="grid">
-              {Array.from({ length: 8 }).map((_, i) => (
-                <div key={i} className="product skeleton" />
-              ))}
-            </div>
-          )}
+          <div className="topbar-right">
+            <button
+              type="button"
+              className="new-chat-chip"
+              onClick={handleCreateNewThread}
+              title="Start a new chat thread"
+            >
+              <PlusIcon />
+              <span>New</span>
+            </button>
+            <button
+              type="button"
+              className="cart-chip"
+              onClick={() => {
+                const next = !cartOpen;
+                setCartOpen(next);
+                if (next) void refreshCart();
+              }}
+              aria-label="My cart"
+            >
+              <CartIcon />
+              <span>Cart</span>
+              {cart && cart.items?.length ? (
+                <span className="cart-chip-count">{cart.items.length}</span>
+              ) : null}
+            </button>
+          </div>
+        </header>
 
-          {offers.length > 0 && (
-            <>
-              <div className="shelf-head">
-                <h2>
-                  {offers.length} results
-                  {activeQuery ? ` for “${activeQuery}”` : ""}
-                </h2>
-                <p>Tap a product to read the shop description. Nothing opens in a new tab.</p>
+        {/* Chat Feed Area */}
+        <div className="chat-feed-scroll">
+          {activeTurns.length === 0 ? (
+            <div className="chat-hero-welcome">
+              <div className="hero-logo-circle">
+                <SparkleIcon />
               </div>
-              <div className="grid">
-                {offers.map((offer, i) => (
+              <h1 className="hero-heading">Where should we find groceries today?</h1>
+              <p className="hero-subtext">
+                Live prices from <strong>Ninja, Tamimi, Panda, Danube & Carrefour</strong> in Riyadh.
+                Compare prices, check stock, and build your cart directly.
+              </p>
+
+              <div className="hero-suggestions-grid">
+                {SUGGESTIONS.map((item) => (
                   <button
-                    key={`${offer.site}-${offer.url}-${i}`}
+                    key={item.label}
                     type="button"
-                    className={`product ${i === 0 ? "is-best" : ""}`}
-                    onClick={() => void showOffer(offer)}
+                    className="hero-suggestion-card"
+                    onClick={() => void runAsk(item.prompt)}
                   >
-                    {i === 0 && <span className="badge">Best match</span>}
-                    <div className="photo">
-                      {offer.image_url ? (
-                        <img src={offer.image_url} alt="" referrerPolicy="no-referrer" />
-                      ) : (
-                        <em>No photo</em>
-                      )}
-                    </div>
-                    <div className="meta">
-                      <span className="store">{STORE_NAME[offer.site] || offer.site}</span>
-                      <strong>{offer.title}</strong>
-                      {offer.price_sar != null && (
-                        <span className="cost">
-                          {Number(offer.price_sar).toFixed(2)} <small>SAR</small>
-                        </span>
-                      )}
-                      <span className="peek">View details</span>
-                    </div>
+                    <span className="card-label">{item.label}</span>
+                    <span className="card-prompt">{item.prompt}</span>
                   </button>
                 ))}
               </div>
-            </>
-          )}
+            </div>
+          ) : (
+            <div className="chat-messages-container">
+              {activeTurns.map((turn, turnIdx) => (
+                <div key={turn.id} className="turn-block">
+                  {/* User Question Row */}
+                  {turn.query && (
+                    <div className="message-row user-row">
+                      <div className="message-avatar user-avatar">You</div>
+                      <div className="message-content user-content">
+                        <p className="user-query-text">{turn.query}</p>
+                      </div>
+                    </div>
+                  )}
 
-          {!busy && !lastError && offers.length === 0 && !hasAnswer && !clarifying && (
-            <div className="shelf-head">
-              <h2>No results for “{activeQuery || turns.at(-1)?.query}”</h2>
+                  {/* Assistant Answer Row */}
+                  <div className="message-row assistant-row">
+                    <div className="message-avatar assistant-avatar">
+                      <SparkleIcon />
+                    </div>
+                    <div className="message-content assistant-content">
+                      {/* Thought / Execution Steps */}
+                      {turn.steps && turn.steps.length > 0 && (
+                        <div className="assistant-steps-container">
+                          {turn.steps.map((step) => (
+                            <span key={`${turn.id}-step-${step.id}`} className="step-badge">
+                              <CheckCircleIcon />
+                              {step.text}
+                            </span>
+                          ))}
+                          {busy && turnIdx === activeTurns.length - 1 && (
+                            <span className="step-badge is-live">
+                              <SpinnerIcon />
+                              Searching stores…
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Main Message Text */}
+                      {turn.answer && (
+                        <div className="assistant-text-bubble">
+                          <p>{turn.answer}</p>
+                        </div>
+                      )}
+
+                      {/* Inline Product Offers Grid */}
+                      {turn.offers && turn.offers.length > 0 && (
+                        <div className="turn-offers-container">
+                          <div className="turn-offers-header">
+                            <span className="offers-count-tag">
+                              {turn.offers.length} options found
+                            </span>
+                            <span className="offers-note">
+                              Click any card to inspect full description or add to cart
+                            </span>
+                          </div>
+                          <div className="turn-offers-grid">
+                            {turn.offers.map((offer, offIdx) => (
+                              <div
+                                key={`${offer.site}-${offer.url}-${offIdx}`}
+                                className={`turn-offer-card ${offIdx === 0 ? "is-best-deal" : ""}`}
+                                onClick={() => void showOffer(offer)}
+                                role="button"
+                                tabIndex={0}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") void showOffer(offer);
+                                }}
+                              >
+                                {offIdx === 0 && (
+                                  <span className="best-deal-badge">Best Match</span>
+                                )}
+                                <div className="offer-image-wrap">
+                                  {offer.image_url ? (
+                                    <img
+                                      src={offer.image_url}
+                                      alt={offer.title}
+                                      referrerPolicy="no-referrer"
+                                    />
+                                  ) : (
+                                    <div className="offer-no-photo">No photo</div>
+                                  )}
+                                </div>
+                                <div className="offer-details">
+                                  <span className={`store-badge store-${offer.site.toLowerCase()}`}>
+                                    {STORE_NAME[offer.site] || offer.site}
+                                  </span>
+                                  <strong className="offer-title" title={offer.title}>
+                                    {offer.title}
+                                  </strong>
+                                  <div className="offer-footer">
+                                    {offer.price_sar != null ? (
+                                      <span className="offer-price">
+                                        {Number(offer.price_sar).toFixed(2)} <small>SAR</small>
+                                      </span>
+                                    ) : (
+                                      <span className="offer-price-na">Check in store</span>
+                                    )}
+                                    <button
+                                      type="button"
+                                      className="quick-add-btn"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void runAsk(`Add ${offer.title} to ${offer.site} cart`);
+                                      }}
+                                    >
+                                      Add
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Clarification Chips if Bot Needs Specifics */}
+                      {turn.clarifying && turn.optionGroups.length > 0 && (
+                        <div className="clarify-container">
+                          {turn.optionGroups.map((group) => (
+                            <div key={group.id} className="clarify-group-block">
+                              <p className="clarify-title">
+                                {group.title}
+                                <span>{group.multi ? " · select multiple" : " · choose one"}</span>
+                              </p>
+                              <div className="clarify-chips-row">
+                                {group.options.map((opt) => {
+                                  const isSelected = (picked[group.id] || []).includes(opt.id);
+                                  return (
+                                    <button
+                                      key={opt.id}
+                                      type="button"
+                                      className={`clarify-chip-btn ${isSelected ? "is-selected" : ""}`}
+                                      disabled={busy}
+                                      onClick={() => toggleOption(group, opt.id)}
+                                    >
+                                      {opt.label}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          ))}
+                          <button
+                            type="button"
+                            className="clarify-submit-btn"
+                            disabled={busy}
+                            onClick={() => searchFromPicks(turn.optionGroups)}
+                          >
+                            Apply Filters & Search
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Cart Action Note */}
+                      {turn.cartNote && (
+                        <div className="cart-action-alert">
+                          <CheckCircleIcon />
+                          <span>{turn.cartNote}</span>
+                        </div>
+                      )}
+
+                      {/* Cart Screenshot Preview */}
+                      {turn.cartShot && (
+                        <figure className="cart-shot-figure">
+                          <div className="cart-shot-frame">
+                            <img
+                              src={turn.cartShot}
+                              alt={`Cart on ${turn.cartSite || "store"}`}
+                            />
+                          </div>
+                          <figcaption>{turn.cartSite || "Shop"} live cart</figcaption>
+                        </figure>
+                      )}
+
+                      {/* Error State */}
+                      {turn.error && (
+                        <div className="assistant-error-alert">
+                          <AlertTriangleIcon />
+                          <span>{turn.error}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              {/* Busy Indicator when loading next turn */}
+              {busy && activeTurns.length > 0 && !lastTurn?.steps?.length && (
+                <div className="message-row assistant-row">
+                  <div className="message-avatar assistant-avatar">
+                    <SparkleIcon />
+                  </div>
+                  <div className="message-content assistant-content">
+                    <div className="typing-indicator">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Quick Follow-up Chips under latest turn */}
+              {!busy && !clarifying && activeTurns.length > 0 && (
+                <div className="chat-followup-chips">
+                  {FOLLOWUPS.map((item) => (
+                    <button
+                      key={item}
+                      type="button"
+                      className="followup-chip"
+                      onClick={() => void runAsk(item)}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div ref={messagesEndRef} />
             </div>
           )}
-        </section>
-      )}
+        </div>
 
+        {/* Anchored ChatGPT-style Input Box */}
+        <div className="chat-input-dock">
+          <form className="chat-input-form" onSubmit={onSubmit}>
+            <div className="chat-input-box">
+              <textarea
+                ref={textareaRef}
+                value={inputQuery}
+                onChange={(e) => setInputQuery(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask Wish Wish to find groceries, compare prices, or add items to cart…"
+                rows={1}
+                disabled={busy}
+              />
+              <button
+                type="submit"
+                className="chat-send-btn"
+                disabled={busy || !inputQuery.trim()}
+                title="Send message"
+                aria-label="Send message"
+              >
+                {busy ? <SpinnerIcon /> : <ArrowUpIcon />}
+              </button>
+            </div>
+            <div className="chat-dock-caption">
+              <span>Wish Wish queries live grocery platforms across Riyadh. Cash on Delivery & live cart sync supported.</span>
+            </div>
+          </form>
+        </div>
+      </main>
+
+      {/* Cart Drawer */}
       {cartOpen && (
         <div className="drawer-back" onClick={() => setCartOpen(false)} role="presentation">
           <aside
@@ -642,15 +1149,15 @@ export default function CompareDesk() {
               type="button"
               className="drawer-x"
               onClick={() => setCartOpen(false)}
-              aria-label="Close"
+              aria-label="Close cart"
             >
-              Close
+              ✕
             </button>
-            <h3 id="cart-drawer-title">My cart</h3>
-            {cartBusy && <p className="cart-empty">Loading…</p>}
+            <h3 id="cart-drawer-title">My Cart</h3>
+            {cartBusy && <p className="cart-empty">Refreshing live cart…</p>}
             {!cartBusy && !cart && (
               <p className="cart-empty">
-                No items yet. Search for a product and say “add the cheapest to cart.”
+                Your cart is empty. Search for an item and ask “add to cart”.
               </p>
             )}
             {!cartBusy && cart && (
@@ -658,7 +1165,7 @@ export default function CompareDesk() {
                 <p className="cart-meta">
                   {STORE_NAME[cart.site] || cart.site || "Shop"} ·{" "}
                   {cart.fulfillment === "pickup" ? "Pickup" : "Delivery"} · Status:{" "}
-                  {cart.status}
+                  <strong>{cart.status}</strong>
                 </p>
                 <ul className="cart-lines">
                   {(cart.items || []).map((item, i) => (
@@ -679,6 +1186,16 @@ export default function CompareDesk() {
                             : ""}
                         </span>
                       </div>
+                      <button
+                        type="button"
+                        className="cart-line-remove"
+                        onClick={() => void removeCartItem(item, i)}
+                        disabled={removingIndex === i}
+                        title={`Remove ${item.name || "item"}`}
+                        aria-label={`Remove ${item.name || "item"}`}
+                      >
+                        {removingIndex === i ? "…" : "Remove"}
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -688,8 +1205,7 @@ export default function CompareDesk() {
                   </p>
                 )}
                 <p className="cart-note">
-                  Order id <code>{cart.id}</code>. Say “place order” in chat when
-                  you’ve given us your address, or close this and keep shopping.
+                  Order id <code>{cart.id}</code>. Say “place order” in chat once your delivery address is confirmed.
                 </p>
               </>
             )}
@@ -697,6 +1213,7 @@ export default function CompareDesk() {
         </div>
       )}
 
+      {/* Product Detail Drawer */}
       {openOffer && (
         <div className="drawer-back" onClick={closeDetail} role="presentation">
           <aside
@@ -707,7 +1224,7 @@ export default function CompareDesk() {
             onClick={(e) => e.stopPropagation()}
           >
             <button type="button" className="drawer-x" onClick={closeDetail} aria-label="Close">
-              Close
+              ✕
             </button>
             <div className="drawer-photo">
               {(detail?.image_url || openOffer.image_url) ? (
@@ -727,10 +1244,10 @@ export default function CompareDesk() {
                 {Number(detail?.price_sar ?? openOffer.price_sar).toFixed(2)} <small>SAR</small>
               </p>
             )}
-            {detailBusy && <p className="drawer-wait">Reading the shop page…</p>}
+            {detailBusy && <p className="drawer-wait">Fetching official product page…</p>}
             {!detailBusy && detail?.error && <p className="agent-error">{detail.error}</p>}
             {!detailBusy && detail && !detail.description && !detail.error && (
-              <p className="drawer-wait">No description on the shop page.</p>
+              <p className="drawer-wait">No extra description available on the store catalog.</p>
             )}
             {!detailBusy && detail?.description && (
               <p className="drawer-copy">{detail.description}</p>
@@ -756,11 +1273,102 @@ export default function CompareDesk() {
   );
 }
 
-function SearchIcon() {
+// Inline SVGs
+function PlusIcon() {
   return (
-    <svg className="search-icon" viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M16.2 16.2 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <line x1="5" y1="12" x2="19" y2="12" />
+    </svg>
+  );
+}
+
+function SidebarToggleIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+      <line x1="9" y1="3" x2="9" y2="21" />
+    </svg>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+  );
+}
+
+function ChatBubbleIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+    </svg>
+  );
+}
+
+function SparkleIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+    </svg>
+  );
+}
+
+function CheckCircleIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+      <polyline points="22 4 12 14.01 9 11.01" />
+    </svg>
+  );
+}
+
+function AlertTriangleIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+      <line x1="12" y1="9" x2="12" y2="13" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+  );
+}
+
+function CartIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="21" r="1" />
+      <circle cx="20" cy="21" r="1" />
+      <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
+    </svg>
+  );
+}
+
+function ArrowUpIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="19" x2="12" y2="5" />
+      <polyline points="5 12 12 5 19 12" />
+    </svg>
+  );
+}
+
+function SpinnerIcon() {
+  return (
+    <svg className="anim-spinner" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+      <circle cx="12" cy="12" r="10" strokeDasharray="32" strokeDashoffset="12" strokeLinecap="round" />
     </svg>
   );
 }
