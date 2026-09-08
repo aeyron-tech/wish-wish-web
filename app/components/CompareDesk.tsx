@@ -46,6 +46,10 @@ export type MyOrder = {
   total_sar: number | null;
   items: CartItem[];
   updated_at?: string;
+  missing_fields?: string[];
+  ask_message?: string;
+  ask_customer_now?: boolean;
+  is_pickup?: boolean;
 } | null;
 
 export type Turn = {
@@ -61,6 +65,7 @@ export type Turn = {
   clarifying: boolean;
   optionGroups: ClarifyGroup[];
   createdAt?: number;
+  responseCreatedAt?: number;
 };
 
 export type ChatThread = {
@@ -116,6 +121,16 @@ function createNewThread(initialTitle: string = "New chat"): ChatThread {
   };
 }
 
+function formatTimestamp(ts?: number): string {
+  if (!ts) return "";
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+}
+
 export default function CompareDesk() {
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>("");
@@ -134,6 +149,7 @@ export default function CompareDesk() {
   const [cartOpen, setCartOpen] = useState(false);
   const [cartBusy, setCartBusy] = useState(false);
   const [removingIndex, setRemovingIndex] = useState<number | null>(null);
+  const [addingKeys, setAddingKeys] = useState<Set<string>>(new Set());
   const [pushCursor, setPushCursor] = useState(0);
 
   const activeThreadIdRef = useRef<string>("");
@@ -260,6 +276,132 @@ export default function CompareDesk() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [openOffer, cartOpen, mobileSidebarOpen]);
+
+  function _addKey(offer: Offer): string {
+    return `${offer.site}::${offer.url || offer.title}`;
+  }
+
+  async function quickAddToCart(offer: Offer): Promise<boolean> {
+    if (!userId && !sessionId) return false;
+    const key = _addKey(offer);
+    if (addingKeys.has(key)) return true; // already in flight for this card
+
+    // 1. Open the drawer AND drop an optimistic line before the network call
+    // fires — the user sees the item land the instant they click Add.
+    setCartOpen(true);
+    setAddingKeys((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+
+    const optimisticItem: CartItem = {
+      name: offer.title,
+      qty: 1,
+      site: offer.site,
+      price_sar: offer.price_sar ?? undefined,
+      image_url: offer.image_url,
+      product_url: offer.url,
+    };
+    const pickup = offer.site === "tamimi";
+    setCart((prev) => {
+      if (prev && prev.site === offer.site) {
+        // Skip if we somehow already have this exact line.
+        const already = (prev.items || []).some(
+          (i) => (i.product_url && i.product_url === offer.url) || i.name === offer.title,
+        );
+        const items = already ? prev.items : [...(prev.items || []), optimisticItem];
+        const total = items.every((i) => typeof i.price_sar === "number")
+          ? Math.round(items.reduce((s, i) => s + (i.price_sar as number) * (i.qty ?? 1), 0) * 100) / 100
+          : prev.total_sar;
+        return { ...prev, items, total_sar: total };
+      }
+      return {
+        id: "pending",
+        site: offer.site,
+        status: "collecting",
+        fulfillment: pickup ? "pickup" : "delivery",
+        total_sar: offer.price_sar ?? null,
+        items: [optimisticItem],
+        ask_customer_now: true,
+        is_pickup: pickup,
+      };
+    });
+
+    // 2. Fire the real add in the background. Reconcile from the backend when
+    // it lands so image/price/missing_fields become authoritative.
+    try {
+      const res = await fetch(`/api/v3/cart/add`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId || undefined,
+          user_id: userId || undefined,
+          site: offer.site,
+          query: offer.title,
+          offer: {
+            name: offer.title,
+            site: offer.site,
+            price_sar: offer.price_sar,
+            image_url: offer.image_url,
+            url: offer.url,
+          },
+        }),
+      });
+      if (!res.ok) {
+        // Roll back the optimistic line so we don't lie to the user.
+        setCart((prev) =>
+          prev
+            ? {
+                ...prev,
+                items: (prev.items || []).filter(
+                  (i) =>
+                    !(
+                      (i.product_url && i.product_url === offer.url) ||
+                      (!i.product_url && i.name === offer.title)
+                    ),
+                ),
+              }
+            : prev,
+        );
+        return false;
+      }
+      // Backend mirrors to dispatch_store; the enriched /api/cart pull is
+      // authoritative for missing_fields, id, total, etc.
+      void refreshCart();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      setAddingKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  async function clearCart() {
+    if (!userId && !sessionId) return;
+    setCartBusy(true);
+    // Optimistically empty the drawer so it feels instant.
+    setCart(null);
+    try {
+      await fetch(`/api/v3/cart/reset`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId || undefined,
+          user_id: userId || undefined,
+        }),
+      });
+      await refreshCart();
+    } catch {
+      // Ignore — refreshCart on next interaction will re-sync.
+    } finally {
+      setCartBusy(false);
+    }
+  }
 
   async function refreshCart() {
     if (!userId && !sessionId) return;
@@ -501,6 +643,10 @@ export default function CompareDesk() {
     } catch {
       patchActiveTurn(id, { error: "Something went wrong. Please try again." });
     } finally {
+      patchActiveTurn(id, (turn) => ({
+        ...turn,
+        responseCreatedAt: turn.responseCreatedAt || Date.now(),
+      }));
       setBusy(false);
     }
   }
@@ -892,6 +1038,11 @@ export default function CompareDesk() {
                       <div className="message-avatar user-avatar">You</div>
                       <div className="message-content user-content">
                         <p className="user-query-text">{turn.query}</p>
+                        {turn.createdAt && (
+                          <span className="message-timestamp">
+                            {formatTimestamp(turn.createdAt)}
+                          </span>
+                        )}
                       </div>
                     </div>
                   )}
@@ -979,16 +1130,29 @@ export default function CompareDesk() {
                                     ) : (
                                       <span className="offer-price-na">Check in store</span>
                                     )}
-                                    <button
-                                      type="button"
-                                      className="quick-add-btn"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        void runAsk(`Add ${offer.title} to ${offer.site} cart`);
-                                      }}
-                                    >
-                                      Add
-                                    </button>
+                                    {(() => {
+                                      const key = _addKey(offer);
+                                      const busy = addingKeys.has(key);
+                                      return (
+                                        <button
+                                          type="button"
+                                          className="quick-add-btn"
+                                          disabled={busy}
+                                          aria-busy={busy}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void (async () => {
+                                              const ok = await quickAddToCart(offer);
+                                              if (!ok) {
+                                                void runAsk(`Add ${offer.title} to ${offer.site} cart`);
+                                              }
+                                            })();
+                                          }}
+                                        >
+                                          {busy ? "Adding…" : "Add"}
+                                        </button>
+                                      );
+                                    })()}
                                   </div>
                                 </div>
                               </div>
@@ -1062,6 +1226,13 @@ export default function CompareDesk() {
                           <AlertTriangleIcon />
                           <span>{turn.error}</span>
                         </div>
+                      )}
+
+                      {/* Response Timestamp */}
+                      {(turn.responseCreatedAt || (turn.createdAt && (!busy || turnIdx < activeTurns.length - 1))) && (
+                        <span className="message-timestamp">
+                          {formatTimestamp(turn.responseCreatedAt || turn.createdAt)}
+                        </span>
                       )}
                     </div>
                   </div>
@@ -1167,6 +1338,19 @@ export default function CompareDesk() {
                   {cart.fulfillment === "pickup" ? "Pickup" : "Delivery"} · Status:{" "}
                   <strong>{cart.status}</strong>
                 </p>
+                {cart.ask_customer_now && cart.missing_fields && cart.missing_fields.length > 0 && (
+                  <div className="cart-ask" role="status" style={{
+                    marginTop: 8,
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    background: "#fff7e6",
+                    border: "1px solid #f0c674",
+                    fontSize: 13,
+                    lineHeight: 1.4,
+                  }}>
+                    <strong>Still need to finalize:</strong> {cart.missing_fields.join(", ")}. Reply in chat with these details to place the order.
+                  </div>
+                )}
                 <ul className="cart-lines">
                   {(cart.items || []).map((item, i) => (
                     <li key={`${item.product_url || item.name}-${i}`}>
@@ -1207,6 +1391,19 @@ export default function CompareDesk() {
                 <p className="cart-note">
                   Order id <code>{cart.id}</code>. Say “place order” in chat once your delivery address is confirmed.
                 </p>
+                <button
+                  type="button"
+                  className="cart-line-remove"
+                  onClick={() => {
+                    if (window.confirm("Clear all items from your local cart? (The real shop cart is untouched.)")) {
+                      void clearCart();
+                    }
+                  }}
+                  disabled={cartBusy}
+                  style={{ marginTop: 8, width: "100%" }}
+                >
+                  {cartBusy ? "Clearing…" : "Clear cart"}
+                </button>
               </>
             )}
           </aside>
@@ -1258,9 +1455,19 @@ export default function CompareDesk() {
                 className="clarify-go"
                 disabled={busy}
                 onClick={() => {
-                  const title = detail?.title || openOffer.title;
+                  const merged: Offer = {
+                    ...openOffer,
+                    title: detail?.title || openOffer.title,
+                    image_url: detail?.image_url || openOffer.image_url,
+                    price_sar: detail?.price_sar ?? openOffer.price_sar,
+                  };
                   closeDetail();
-                  void runAsk(`Add ${title} to ${openOffer.site} cart`);
+                  void (async () => {
+                    const ok = await quickAddToCart(merged);
+                    if (!ok) {
+                      void runAsk(`Add ${merged.title} to ${merged.site} cart`);
+                    }
+                  })();
                 }}
               >
                 Add to {STORE_NAME[openOffer.site] || openOffer.site} cart

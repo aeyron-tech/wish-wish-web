@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
       title: String(data.title || ""),
       price_sar: data.price_sar ?? null,
       description: String(data.description || ""),
-      image_url: String(data.image_url || ""),
+      image_url: /loyalty[-_]?point|\/assets\/icons\//i.test(String(data.image_url || "")) ? "" : String(data.image_url || ""),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Wish Wish API is not reachable.";

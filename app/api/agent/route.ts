@@ -9,6 +9,12 @@ const BACKEND = (
 ).replace(/\/$/, "");
 const TOKEN = process.env.WISHWISH_TOKEN || "test";
 
+function cleanImageUrl(url: unknown): string {
+  const s = String(url || "").trim();
+  if (!s || /loyalty[-_]?point|\/assets\/icons\//i.test(s)) return "";
+  return s;
+}
+
 function asOffers(products: unknown) {
   if (!Array.isArray(products)) return [];
   return products.map((raw) => {
@@ -19,7 +25,7 @@ function asOffers(products: unknown) {
       title: String(p.name || p.title || ""),
       price_sar: typeof price === "number" ? price : price != null ? Number(price) : null,
       url: String(p.url || ""),
-      image_url: String(p.image || p.image_url || ""),
+      image_url: cleanImageUrl(p.image || p.image_url),
     };
   });
 }
