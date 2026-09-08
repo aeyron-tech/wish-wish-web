@@ -29,6 +29,27 @@ type ClarifyGroup = {
 
 type Step = { id: number; text: string };
 
+type CartItem = {
+  name?: string;
+  qty?: number;
+  price_sar?: number;
+  site?: string;
+  product_url?: string;
+  image_url?: string;
+};
+
+type MyOrder = {
+  id: string;
+  site: string;
+  status: string;
+  fulfillment: string;
+  total_sar: number | null;
+  items: CartItem[];
+  updated_at?: string;
+} | null;
+
+const USER_ID_KEY = "wishwish.user_id";
+
 type Turn = {
   id: number;
   query: string;
@@ -71,6 +92,52 @@ export default function CompareDesk() {
   const [detail, setDetail] = useState<ProductDetail | null>(null);
   const [detailBusy, setDetailBusy] = useState(false);
   const [detailCache, setDetailCache] = useState<Record<string, ProductDetail>>({});
+  const [userId, setUserId] = useState("");
+  const [cart, setCart] = useState<MyOrder>(null);
+  const [cartOpen, setCartOpen] = useState(false);
+  const [cartBusy, setCartBusy] = useState(false);
+  const [pushCursor, setPushCursor] = useState(0);
+
+  // Persist a per-browser user_id so the same person's cart survives page
+  // reloads and new chat sessions. When real login lands, swap this for the
+  // logged-in customer id from the storefront.
+  useEffect(() => {
+    try {
+      let existing = window.localStorage.getItem(USER_ID_KEY) || "";
+      if (!existing) {
+        existing =
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? `web-${crypto.randomUUID()}`
+            : `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        window.localStorage.setItem(USER_ID_KEY, existing);
+      }
+      setUserId(existing);
+    } catch {
+      // localStorage may be unavailable (private mode) — anonymous session is fine.
+    }
+  }, []);
+
+  async function refreshCart() {
+    if (!userId && !sessionId) return;
+    setCartBusy(true);
+    try {
+      const qs = new URLSearchParams();
+      if (userId) qs.set("user_id", userId);
+      if (sessionId) qs.set("session_id", sessionId);
+      const res = await fetch(`/api/cart?${qs.toString()}`);
+      const json = (await res.json()) as Record<string, unknown>;
+      if (!res.ok) {
+        setCart(null);
+        return;
+      }
+      const raw = (json.data || null) as MyOrder;
+      setCart(raw && raw.id ? raw : null);
+    } catch {
+      setCart(null);
+    } finally {
+      setCartBusy(false);
+    }
+  }
 
   function resetHome() {
     setSearched(false);
@@ -80,6 +147,8 @@ export default function CompareDesk() {
     setTurns([]);
     setSessionId("");
     setPicked({});
+    setCart(null);
+    setCartOpen(false);
     closeDetail();
   }
 
@@ -133,7 +202,7 @@ export default function CompareDesk() {
       const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q, session_id: sessionId }),
+        body: JSON.stringify({ query: q, session_id: sessionId, user_id: userId }),
       });
       const json = (await res.json()) as Record<string, unknown>;
       if (!res.ok) {
@@ -154,6 +223,7 @@ export default function CompareDesk() {
           cartSite: site,
         });
         pushStep(`In the ${site} cart`);
+        void refreshCart();
       }
       const groups = Array.isArray(json.option_groups)
         ? (json.option_groups as ClarifyGroup[])
@@ -266,6 +336,68 @@ export default function CompareDesk() {
   const clarifying = Boolean(lastTurn?.clarifying && lastTurn.optionGroups.length);
   const hasAnswer = turns.some((turn) => turn.answer || turn.cartNote);
 
+  // Poll for agent-pushed messages (rider called, on the way, delivered)
+  // while an order is active. Each new push lands in the thread as an agent
+  // turn — same look and feel as any other assistant reply.
+  useEffect(() => {
+    if (!userId && !sessionId) return;
+    const active = Boolean(
+      cart && ["placed", "rider_calling", "with_rider"].includes(cart.status),
+    );
+    if (!active) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const qs = new URLSearchParams();
+        if (userId) qs.set("user_id", userId);
+        if (sessionId) qs.set("session_id", sessionId);
+        qs.set("since", String(pushCursor));
+        const res = await fetch(`/api/chat/messages?${qs.toString()}`);
+        if (!res.ok) return;
+        const json = (await res.json()) as Record<string, unknown>;
+        const data = (json.data || {}) as Record<string, unknown>;
+        const messages = Array.isArray(data.messages)
+          ? (data.messages as Array<{ id: number; text: string; kind?: string }>)
+          : [];
+        if (cancelled || messages.length === 0) {
+          if (typeof data.cursor === "number") setPushCursor(data.cursor);
+          return;
+        }
+        setTurns((prev) => {
+          let next = turnSeq;
+          const additions = messages.map((m) => {
+            const id = next++;
+            return {
+              id,
+              query: "",
+              steps: [],
+              answer: String(m.text || ""),
+              cartNote: "",
+              cartShot: "",
+              cartSite: "",
+              error: "",
+              clarifying: false,
+              optionGroups: [],
+            } as Turn;
+          });
+          setTurnSeq(next);
+          return [...prev, ...additions];
+        });
+        if (typeof data.cursor === "number") setPushCursor(data.cursor);
+        void refreshCart();
+      } catch {
+        // network hiccup — next tick will retry
+      }
+    };
+    void tick();
+    const handle = window.setInterval(tick, 6000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, sessionId, cart?.status, pushCursor]);
+
   useEffect(() => {
     if (!openOffer) return;
     const onKey = (e: KeyboardEvent) => {
@@ -309,6 +441,21 @@ export default function CompareDesk() {
             </button>
           </form>
         )}
+        <button
+          type="button"
+          className="cart-chip"
+          onClick={() => {
+            const next = !cartOpen;
+            setCartOpen(next);
+            if (next) void refreshCart();
+          }}
+          aria-label="My cart"
+        >
+          My cart
+          {cart && cart.items?.length ? (
+            <span className="cart-chip-count">{cart.items.length}</span>
+          ) : null}
+        </button>
       </header>
 
       {showHome && (
@@ -349,7 +496,7 @@ export default function CompareDesk() {
             <div className="thread">
               {turns.map((turn, i) => (
                 <article key={turn.id} className="agent">
-                  <p className="agent-ask">{turn.query}</p>
+                  {turn.query && <p className="agent-ask">{turn.query}</p>}
                   <div className="agent-steps">
                     {turn.steps.map((step) => (
                       <span key={`${turn.id}-step-${step.id}`} className="agent-step">
@@ -480,6 +627,74 @@ export default function CompareDesk() {
             </div>
           )}
         </section>
+      )}
+
+      {cartOpen && (
+        <div className="drawer-back" onClick={() => setCartOpen(false)} role="presentation">
+          <aside
+            className="drawer cart-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="cart-drawer-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="drawer-x"
+              onClick={() => setCartOpen(false)}
+              aria-label="Close"
+            >
+              Close
+            </button>
+            <h3 id="cart-drawer-title">My cart</h3>
+            {cartBusy && <p className="cart-empty">Loading…</p>}
+            {!cartBusy && !cart && (
+              <p className="cart-empty">
+                No items yet. Search for a product and say “add the cheapest to cart.”
+              </p>
+            )}
+            {!cartBusy && cart && (
+              <>
+                <p className="cart-meta">
+                  {STORE_NAME[cart.site] || cart.site || "Shop"} ·{" "}
+                  {cart.fulfillment === "pickup" ? "Pickup" : "Delivery"} · Status:{" "}
+                  {cart.status}
+                </p>
+                <ul className="cart-lines">
+                  {(cart.items || []).map((item, i) => (
+                    <li key={`${item.product_url || item.name}-${i}`}>
+                      <div className="cart-line-photo">
+                        {item.image_url ? (
+                          <img src={item.image_url} alt="" referrerPolicy="no-referrer" />
+                        ) : (
+                          <em>—</em>
+                        )}
+                      </div>
+                      <div className="cart-line-meta">
+                        <strong>{item.name || "Item"}</strong>
+                        <span>
+                          Qty {item.qty ?? 1}
+                          {item.price_sar != null
+                            ? ` · ${Number(item.price_sar).toFixed(2)} SAR`
+                            : ""}
+                        </span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {cart.total_sar != null && (
+                  <p className="cart-total">
+                    Total: {Number(cart.total_sar).toFixed(2)} SAR · COD
+                  </p>
+                )}
+                <p className="cart-note">
+                  Order id <code>{cart.id}</code>. Say “place order” in chat when
+                  you’ve given us your address, or close this and keep shopping.
+                </p>
+              </>
+            )}
+          </aside>
+        </div>
       )}
 
       {openOffer && (

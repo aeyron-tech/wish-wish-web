@@ -32,6 +32,7 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const query = String(body.query || body.message || "").trim();
   const sessionId = String(body.session_id || "").trim();
+  const userId = String(body.user_id || "").trim();
 
   try {
     const res = await fetch(`${BACKEND}/v2/chat`, {
@@ -41,6 +42,7 @@ export async function POST(req: NextRequest) {
         token: TOKEN,
         message: query,
         session_id: sessionId || undefined,
+        user_id: userId || undefined,
       }),
       signal: AbortSignal.timeout(170_000),
     });
