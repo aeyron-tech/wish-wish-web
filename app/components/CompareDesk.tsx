@@ -151,6 +151,7 @@ export default function CompareDesk() {
   const [removingIndex, setRemovingIndex] = useState<number | null>(null);
   const [addingKeys, setAddingKeys] = useState<Set<string>>(new Set());
   const [pushCursor, setPushCursor] = useState(0);
+  const [fetchingLocation, setFetchingLocation] = useState(false);
 
   const activeThreadIdRef = useRef<string>("");
   const threadsRef = useRef<ChatThread[]>([]);
@@ -511,6 +512,31 @@ export default function CompareDesk() {
       } catch {}
       return nextThreads;
     });
+  }
+
+  async function handleLocationShare() {
+    if (!navigator.geolocation) {
+      alert("Your browser doesn't support location sharing.");
+      return;
+    }
+    setFetchingLocation(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setFetchingLocation(false);
+        const { latitude, longitude } = pos.coords;
+        const mapLink = `https://maps.google.com/?q=${latitude},${longitude}`;
+        void runAsk(`My location pin: ${mapLink}`);
+      },
+      (err) => {
+        setFetchingLocation(false);
+        if (err.code === err.PERMISSION_DENIED) {
+          alert("Location access denied. Please enable location in your browser settings.");
+        } else {
+          alert("Could not get your location. Please try again.");
+        }
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
+    );
   }
 
   async function runAsk(raw: string) {
@@ -1131,25 +1157,17 @@ export default function CompareDesk() {
                                       <span className="offer-price-na">Check in store</span>
                                     )}
                                     {(() => {
-                                      const key = _addKey(offer);
-                                      const busy = addingKeys.has(key);
                                       return (
                                         <button
                                           type="button"
                                           className="quick-add-btn"
                                           disabled={busy}
-                                          aria-busy={busy}
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            void (async () => {
-                                              const ok = await quickAddToCart(offer);
-                                              if (!ok) {
-                                                void runAsk(`Add ${offer.title} to ${offer.site} cart`);
-                                              }
-                                            })();
+                                            void runAsk(`Add ${offer.title} from ${STORE_NAME[offer.site] || offer.site} to cart`);
                                           }}
                                         >
-                                          {busy ? "Adding…" : "Add"}
+                                          Add
                                         </button>
                                       );
                                     })()}
@@ -1289,6 +1307,16 @@ export default function CompareDesk() {
                 rows={1}
                 disabled={busy}
               />
+              <button
+                type="button"
+                className="chat-location-btn"
+                disabled={busy || fetchingLocation}
+                title="Share your location pin"
+                aria-label="Share location"
+                onClick={handleLocationShare}
+              >
+                {fetchingLocation ? <SpinnerIcon /> : <LocationPinIcon />}
+              </button>
               <button
                 type="submit"
                 className="chat-send-btn"
@@ -1455,19 +1483,10 @@ export default function CompareDesk() {
                 className="clarify-go"
                 disabled={busy}
                 onClick={() => {
-                  const merged: Offer = {
-                    ...openOffer,
-                    title: detail?.title || openOffer.title,
-                    image_url: detail?.image_url || openOffer.image_url,
-                    price_sar: detail?.price_sar ?? openOffer.price_sar,
-                  };
+                  const title = detail?.title || openOffer.title;
+                  const site = STORE_NAME[openOffer.site] || openOffer.site;
                   closeDetail();
-                  void (async () => {
-                    const ok = await quickAddToCart(merged);
-                    if (!ok) {
-                      void runAsk(`Add ${merged.title} to ${merged.site} cart`);
-                    }
-                  })();
+                  void runAsk(`Add ${title} from ${site} to cart`);
                 }}
               >
                 Add to {STORE_NAME[openOffer.site] || openOffer.site} cart
@@ -1576,6 +1595,15 @@ function SpinnerIcon() {
   return (
     <svg className="anim-spinner" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
       <circle cx="12" cy="12" r="10" strokeDasharray="32" strokeDashoffset="12" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function LocationPinIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+      <circle cx="12" cy="10" r="3" />
     </svg>
   );
 }

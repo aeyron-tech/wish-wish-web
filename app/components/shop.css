@@ -1135,6 +1135,31 @@ button, input, textarea {
   cursor: not-allowed;
 }
 
+.chat-location-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-subtle);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 120ms ease;
+}
+
+.chat-location-btn:hover:not(:disabled) {
+  background: var(--color-bg-subtle, #f5f2ed);
+  color: var(--color-brand-primary);
+  transform: scale(1.08);
+}
+
+.chat-location-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 .chat-dock-caption {
   text-align: center;
   font-size: 11.5px;
