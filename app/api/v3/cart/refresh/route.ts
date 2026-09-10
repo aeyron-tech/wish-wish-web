@@ -19,7 +19,7 @@ export async function POST(req: NextRequest) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(45_000),
+      signal: AbortSignal.timeout(90_000),
     });
     const text = await res.text();
     let json: Record<string, unknown> = {};
