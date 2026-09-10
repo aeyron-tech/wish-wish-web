@@ -82,6 +82,15 @@ export async function POST(req: NextRequest) {
       message: String(turn.message || "").trim(),
       clarifying: Boolean(inner.clarifying),
       option_groups: Array.isArray(inner.option_groups) ? inner.option_groups : [],
+      ask_customer_now: Boolean(inner.ask_customer_now),
+      missing_fields: Array.isArray(inner.missing)
+        ? inner.missing
+        : Array.isArray(inner.missing_fields)
+          ? inner.missing_fields
+          : [],
+      order: inner.order || null,
+      delivery: inner.delivery || null,
+      confirm_summary: String(inner.confirm_summary || "").trim() || null,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Wish Wish API is not reachable.";

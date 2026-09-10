@@ -387,17 +387,9 @@ export default function CompareDesk() {
     });
 
     // 2. Route the add through the chat agent so it can add to the shared cart
-    // AND prompt for delivery details (name, mobile, district, drop-off notes)
-    // in the same turn. Rolls back the optimistic line if the agent refuses.
+    // and only ask for delivery fields still missing (saved details are reused).
     try {
-      // Force the agent to re-ask delivery/pickup details on every add — each
-      // item may go to a different recipient, address, or pickup window, so we
-      // never want it to silently reuse the last order's fields.
-      const pickupSite = offer.site === "tamimi";
-      const askAgain = pickupSite
-        ? "Please ask me again for the pickup person name, KSA mobile, and preferred pickup time for this order — do not reuse details from any previous order."
-        : "Please ask me again for the recipient name, KSA mobile, district/street, building/floor/unit, map pin, and drop-off notes for this order — do not reuse details from any previous order.";
-      const chatMessage = `Add "${offer.title}" from ${siteLabel} to my cart. ${askAgain}`;
+      const chatMessage = `Add "${offer.title}" from ${siteLabel} to my cart.`;
       const res = await fetch(`/api/agent`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -457,6 +449,34 @@ export default function CompareDesk() {
         cartNote: agentAnswer || `Added "${offer.title}" to your ${siteLabel} cart.`,
         cartSite: siteLabel,
       });
+
+      // Persist image / url / price onto the shared cart even if the chat
+      // agent path stored a bare name-only line.
+      try {
+        await fetch(`/api/v3/cart/add`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId || json.session_id || undefined,
+            user_id: userId || undefined,
+            site: offer.site,
+            query: offer.title,
+            offer: {
+              name: offer.title,
+              site: offer.site,
+              price_sar: offer.price_sar,
+              price: offer.price_sar,
+              image_url: offer.image_url,
+              image: offer.image_url,
+              url: offer.url,
+              product_url: offer.url,
+            },
+          }),
+        });
+      } catch {
+        // Non-fatal — cart drawer may miss the photo until next add.
+      }
+
       void refreshCart();
       return true;
     } catch {
@@ -735,7 +755,19 @@ export default function CompareDesk() {
     };
 
     try {
-      pushStep("Searching live Riyadh stores (Ninja, Tamimi, Panda, Danube, Carrefour)…");
+      const lowQ = q.toLowerCase();
+      const deliveryTurn =
+        /\b(change|update|set)\b.*\b(name|phone|address|street|notes?|pin)\b/.test(lowQ) ||
+        /\b(my name is|delivery details|place order|drop-?off|map pin)\b/.test(lowQ) ||
+        /\b(اسمي|عنوان|جوال)\b/.test(lowQ);
+      const cartTurn =
+        /\b(add|remove|delete|drop|clear|view|show|check)\b.*\b(cart|basket)\b/.test(lowQ) ||
+        /\b(remove|delete|drop)\b/.test(lowQ) ||
+        /\b(my cart|empty cart|in my cart|in the cart|cart right now|current cart)\b/.test(lowQ);
+      if (deliveryTurn) pushStep("Updating delivery details…");
+      else if (/\b(remove|delete|drop|clear)\b/.test(lowQ)) pushStep("Updating your cart…");
+      else if (cartTurn) pushStep("Checking your cart…");
+      else pushStep("Searching live Riyadh stores (Ninja, Tamimi, Panda, Danube, Carrefour)…");
       const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -775,13 +807,24 @@ export default function CompareDesk() {
         patchActiveTurn(id, { offers: nextOffers });
       }
 
-      if (json.action === "view_cart") {
+      if (json.action === "view_cart" || json.action === "collect_delivery" || json.action === "delivery_saved") {
         const site = STORE_NAME[String(json.site || "")] || String(json.site || "shop");
         patchActiveTurn(id, {
           cartNote: String(json.message || `Cart on ${site}.`),
           cartSite: site,
         });
-        pushStep(`In the ${site} cart`);
+        if (json.action === "view_cart") {
+          pushStep("Showing your cart");
+        } else if (json.action === "collect_delivery") {
+          const missing = Array.isArray(json.missing_fields) ? (json.missing_fields as string[]) : [];
+          pushStep(
+            missing.length
+              ? `Still need delivery details: ${missing.join(", ")}`
+              : "Collecting delivery details",
+          );
+        } else {
+          pushStep("Delivery details updated");
+        }
         void refreshCart();
       }
 
