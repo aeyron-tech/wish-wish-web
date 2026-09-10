@@ -758,7 +758,7 @@ export default function CompareDesk() {
       const lowQ = q.toLowerCase();
       const deliveryTurn =
         /\b(change|update|set)\b.*\b(name|phone|address|street|notes?|pin)\b/.test(lowQ) ||
-        /\b(my name is|delivery details|place order|drop-?off|map pin)\b/.test(lowQ) ||
+        /\b(my name is|delivery details|updated details|my details|place order|drop-?off|map pin)\b/.test(lowQ) ||
         /\b(اسمي|عنوان|جوال)\b/.test(lowQ);
       const cartTurn =
         /\b(add|remove|delete|drop|clear|view|show|check)\b.*\b(cart|basket)\b/.test(lowQ) ||
