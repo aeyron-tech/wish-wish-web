@@ -12,15 +12,14 @@ export async function POST(req: NextRequest) {
   try {
     body = (await req.json()) as Record<string, unknown>;
   } catch {
-    return Response.json({ error: "invalid json body" }, { status: 400 });
+    body = {};
   }
-
   try {
-    const res = await fetch(`${BACKEND}/v3/cart/add`, {
+    const res = await fetch(`${BACKEND}/v3/cart/refresh`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(45_000),
     });
     const text = await res.text();
     let json: Record<string, unknown> = {};
@@ -31,7 +30,7 @@ export async function POST(req: NextRequest) {
     }
     return Response.json(json, { status: res.status });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "cart add unreachable";
+    const msg = err instanceof Error ? err.message : "cart refresh unreachable";
     return Response.json({ error: msg }, { status: 503 });
   }
 }

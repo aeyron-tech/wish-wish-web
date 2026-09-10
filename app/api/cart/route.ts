@@ -11,14 +11,12 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const userId = url.searchParams.get("user_id") || "";
   const sessionId = url.searchParams.get("session_id") || "";
-  if (!userId && !sessionId) {
-    return Response.json({ error: "user_id or session_id required" }, { status: 400 });
-  }
   const qs = new URLSearchParams();
   if (userId) qs.set("user_id", userId);
   if (sessionId) qs.set("session_id", sessionId);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
   try {
-    const res = await fetch(`${BACKEND}/v2/orders/me?${qs.toString()}`, {
+    const res = await fetch(`${BACKEND}/v2/orders/me${suffix}`, {
       signal: AbortSignal.timeout(15_000),
     });
     const text = await res.text();
@@ -44,10 +42,6 @@ export async function DELETE(req: NextRequest) {
   const index = url.searchParams.get("index");
   const clear = url.searchParams.get("clear");
 
-  if (!userId && !sessionId) {
-    return Response.json({ error: "user_id or session_id required" }, { status: 400 });
-  }
-
   const qs = new URLSearchParams();
   if (userId) qs.set("user_id", userId);
   if (sessionId) qs.set("session_id", sessionId);
@@ -56,9 +50,10 @@ export async function DELETE(req: NextRequest) {
   if (index !== null && index !== undefined) qs.set("index", index);
 
   const endpoint = clear === "1" || clear === "true" ? "/v2/orders/me/clear" : "/v2/orders/me/items";
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
 
   try {
-    const res = await fetch(`${BACKEND}${endpoint}?${qs.toString()}`, {
+    const res = await fetch(`${BACKEND}${endpoint}${suffix}`, {
       method: "DELETE",
       signal: AbortSignal.timeout(15_000),
     });
@@ -75,4 +70,5 @@ export async function DELETE(req: NextRequest) {
     return Response.json({ error: msg }, { status: 503 });
   }
 }
+
 

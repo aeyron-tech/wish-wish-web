@@ -14,9 +14,6 @@ export async function POST(req: NextRequest) {
   } catch {
     return Response.json({ error: "invalid json body" }, { status: 400 });
   }
-  if (!body.session_id && !body.user_id) {
-    return Response.json({ error: "user_id or session_id required" }, { status: 400 });
-  }
   try {
     const res = await fetch(`${BACKEND}/v3/cart/reset`, {
       method: "POST",

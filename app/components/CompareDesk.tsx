@@ -89,6 +89,44 @@ const STORE_NAME: Record<string, string> = {
   carrefour: "Carrefour",
 };
 
+function cartShopLabel(cart: MyOrder): string {
+  const names = [
+    ...new Set(
+      (cart?.items || [])
+        .map((i) => STORE_NAME[String(i.site || "")] || String(i.site || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (names.length) return names.join(" · ");
+  return STORE_NAME[cart?.site || ""] || cart?.site || "Cart";
+}
+
+function coerceCartItem(item: CartItem & { price?: number; quantity?: number; url?: string; image?: string }): CartItem {
+  const price =
+    typeof item.price_sar === "number"
+      ? item.price_sar
+      : typeof item.price === "number"
+        ? item.price
+        : undefined;
+  return {
+    ...item,
+    qty: item.qty ?? item.quantity ?? 1,
+    price_sar: price,
+    product_url: item.product_url || item.url || "",
+    image_url: item.image_url || item.image || "",
+  };
+}
+
+function coerceCartOrder(raw: MyOrder): MyOrder {
+  if (!raw) return raw;
+  const items = (raw.items || []).map((item) => coerceCartItem(item));
+  const priced = items.every((i) => typeof i.price_sar === "number");
+  const total = priced
+    ? Math.round(items.reduce((s, i) => s + (i.price_sar as number) * (i.qty ?? 1), 0) * 100) / 100
+    : raw.total_sar;
+  return { ...raw, items, total_sar: total };
+}
+
 const SUGGESTIONS = [
   { label: "🥛 Fresh Milk 1L", prompt: "Milk 1L - find the best price" },
   { label: "🥚 Farm Eggs (30 pack)", prompt: "Fresh eggs 30 pack lowest price" },
@@ -283,9 +321,8 @@ export default function CompareDesk() {
   }
 
   async function quickAddToCart(offer: Offer): Promise<boolean> {
-    if (!userId && !sessionId) return false;
     const key = _addKey(offer);
-    if (addingKeys.has(key)) return true; // already in flight for this card
+    if (addingKeys.has(key)) return true;
 
     // 1. Open the drawer AND drop an optimistic line before the network call
     // fires — the user sees the item land the instant they click Add.
@@ -296,6 +333,14 @@ export default function CompareDesk() {
       return next;
     });
 
+    // 1b. Mirror the click into the chat so the user sees the add there too.
+    const siteLabel = STORE_NAME[offer.site] || offer.site || "shop";
+    const chatTurnId = appendCartTurn(
+      `Add "${offer.title}" to ${siteLabel} cart`,
+      `Adding to ${siteLabel} cart…`,
+      offer.site,
+    );
+
     const optimisticItem: CartItem = {
       name: offer.title,
       qty: 1,
@@ -304,74 +349,118 @@ export default function CompareDesk() {
       image_url: offer.image_url,
       product_url: offer.url,
     };
-    const pickup = offer.site === "tamimi";
     setCart((prev) => {
-      if (prev && prev.site === offer.site) {
-        // Skip if we somehow already have this exact line.
-        const already = (prev.items || []).some(
-          (i) => (i.product_url && i.product_url === offer.url) || i.name === offer.title,
-        );
-        const items = already ? prev.items : [...(prev.items || []), optimisticItem];
-        const total = items.every((i) => typeof i.price_sar === "number")
-          ? Math.round(items.reduce((s, i) => s + (i.price_sar as number) * (i.qty ?? 1), 0) * 100) / 100
-          : prev.total_sar;
-        return { ...prev, items, total_sar: total };
-      }
+      const existing = prev?.items || [];
+      let matched = false;
+      const items = existing.map((i) => {
+        const sameSite = (i.site || prev?.site) === offer.site;
+        const isSame =
+          sameSite &&
+          ((i.product_url && i.product_url === offer.url) || i.name === offer.title);
+        if (isSame) {
+          matched = true;
+          return {
+            ...i,
+            site: i.site || offer.site,
+            image_url: i.image_url || optimisticItem.image_url,
+            price_sar: i.price_sar ?? optimisticItem.price_sar,
+          };
+        }
+        return i;
+      });
+      const finalItems = matched ? items : [...items, optimisticItem];
+      const total = finalItems.every((i) => typeof i.price_sar === "number")
+        ? Math.round(finalItems.reduce((s, i) => s + (i.price_sar as number) * (i.qty ?? 1), 0) * 100) / 100
+        : prev?.total_sar ?? (offer.price_sar != null ? offer.price_sar : null);
       return {
-        id: "pending",
-        site: offer.site,
-        status: "collecting",
-        fulfillment: pickup ? "pickup" : "delivery",
-        total_sar: offer.price_sar ?? null,
-        items: [optimisticItem],
+        id: prev?.id || "pending",
+        site: prev?.site || offer.site,
+        status: prev?.status || "collecting",
+        fulfillment: "delivery",
+        total_sar: total,
+        items: finalItems,
         ask_customer_now: true,
-        is_pickup: pickup,
+        is_pickup: false,
+        missing_fields: prev?.missing_fields,
+        ask_message: prev?.ask_message,
       };
     });
 
-    // 2. Fire the real add in the background. Reconcile from the backend when
-    // it lands so image/price/missing_fields become authoritative.
+    // 2. Route the add through the chat agent so it can add to the shared cart
+    // AND prompt for delivery details (name, mobile, district, drop-off notes)
+    // in the same turn. Rolls back the optimistic line if the agent refuses.
     try {
-      const res = await fetch(`/api/v3/cart/add`, {
+      // Force the agent to re-ask delivery/pickup details on every add — each
+      // item may go to a different recipient, address, or pickup window, so we
+      // never want it to silently reuse the last order's fields.
+      const pickupSite = offer.site === "tamimi";
+      const askAgain = pickupSite
+        ? "Please ask me again for the pickup person name, KSA mobile, and preferred pickup time for this order — do not reuse details from any previous order."
+        : "Please ask me again for the recipient name, KSA mobile, district/street, building/floor/unit, map pin, and drop-off notes for this order — do not reuse details from any previous order.";
+      const chatMessage = `Add "${offer.title}" from ${siteLabel} to my cart. ${askAgain}`;
+      const res = await fetch(`/api/agent`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          query: chatMessage,
           session_id: sessionId || undefined,
           user_id: userId || undefined,
-          site: offer.site,
-          query: offer.title,
-          offer: {
-            name: offer.title,
-            site: offer.site,
-            price_sar: offer.price_sar,
-            image_url: offer.image_url,
-            url: offer.url,
-          },
         }),
       });
+      const json = (await res.json()) as Record<string, unknown>;
+
       if (!res.ok) {
-        // Roll back the optimistic line so we don't lie to the user.
         setCart((prev) =>
           prev
             ? {
                 ...prev,
-                items: (prev.items || []).filter(
-                  (i) =>
-                    !(
-                      (i.product_url && i.product_url === offer.url) ||
-                      (!i.product_url && i.name === offer.title)
-                    ),
-                ),
+                items: (prev.items || []).filter((i) => {
+                  const sameSite = (i.site || prev.site) === offer.site;
+                  if (!sameSite) return true;
+                  if (i.product_url && i.product_url === offer.url) return false;
+                  if (!i.product_url && i.name === offer.title) return false;
+                  return true;
+                }),
               }
             : prev,
         );
+        const errText = String(
+          json.error || json.detail || json.message || "Could not add to cart.",
+        );
+        patchActiveTurn(chatTurnId, { cartNote: "", error: errText });
         return false;
       }
-      // Backend mirrors to dispatch_store; the enriched /api/cart pull is
-      // authoritative for missing_fields, id, total, etc.
+
+      // Persist the session id the backend created for this add so subsequent
+      // chat turns land on the same conversation.
+      if (json.session_id) {
+        const sid = String(json.session_id);
+        const targetThreadId = activeThreadIdRef.current;
+        setThreads((prevThreads) => {
+          const nextThreads = prevThreads.map((t) =>
+            t.id === targetThreadId ? { ...t, sessionId: sid } : t,
+          );
+          threadsRef.current = nextThreads;
+          try {
+            window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(nextThreads));
+          } catch {}
+          return nextThreads;
+        });
+      }
+
+      // The agent's answer typically includes "Added … Please share name,
+      // mobile, district, …" — surface it verbatim in the alert row so the
+      // user sees the follow-up questions in chat. Leave `answer` empty so
+      // the same text doesn't render twice (bubble + alert).
+      const agentAnswer = String(json.message || "").trim();
+      patchActiveTurn(chatTurnId, {
+        cartNote: agentAnswer || `Added "${offer.title}" to your ${siteLabel} cart.`,
+        cartSite: siteLabel,
+      });
       void refreshCart();
       return true;
     } catch {
+      patchActiveTurn(chatTurnId, { cartNote: "", error: "Could not reach the shop. Try again." });
       return false;
     } finally {
       setAddingKeys((prev) => {
@@ -383,7 +472,6 @@ export default function CompareDesk() {
   }
 
   async function clearCart() {
-    if (!userId && !sessionId) return;
     setCartBusy(true);
     // Optimistically empty the drawer so it feels instant.
     setCart(null);
@@ -405,29 +493,38 @@ export default function CompareDesk() {
   }
 
   async function refreshCart() {
-    if (!userId && !sessionId) return;
     setCartBusy(true);
     try {
       const qs = new URLSearchParams();
       if (userId) qs.set("user_id", userId);
       if (sessionId) qs.set("session_id", sessionId);
-      const res = await fetch(`/api/cart?${qs.toString()}`);
+      const suffix = qs.toString() ? `?${qs.toString()}` : "";
+      const res = await fetch(`/api/cart${suffix}`);
       const json = (await res.json()) as Record<string, unknown>;
       if (!res.ok) {
-        setCart(null);
         return;
       }
       const raw = (json.data || null) as MyOrder;
-      setCart(raw && raw.id ? raw : null);
+      if (raw && raw.id) {
+        setCart(coerceCartOrder(raw));
+      } else if (addingKeys.size === 0) {
+        setCart(null);
+      }
     } catch {
-      setCart(null);
+      // Network hiccup — keep whatever we already have on screen.
     } finally {
       setCartBusy(false);
     }
   }
 
+  useEffect(() => {
+    void refreshCart();
+    // One shared cart for the whole app — load it as soon as the desk mounts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function removeCartItem(item: CartItem, index: number) {
-    if ((!userId && !sessionId) || removingIndex !== null) return;
+    if (removingIndex !== null) return;
     setRemovingIndex(index);
     try {
       const qs = new URLSearchParams();
@@ -443,7 +540,7 @@ export default function CompareDesk() {
       const json = (await res.json()) as Record<string, unknown>;
       if (res.ok && json.data) {
         const updated = json.data as MyOrder;
-        setCart(updated && updated.id ? updated : null);
+        setCart(updated && updated.id ? coerceCartOrder(updated) : null);
       } else {
         await refreshCart();
       }
@@ -493,6 +590,41 @@ export default function CompareDesk() {
       } catch {}
       return remaining;
     });
+  }
+
+  function appendCartTurn(query: string, note: string, site: string): number {
+    const targetThreadId = activeThreadIdRef.current;
+    const id = turnSeq;
+    setTurnSeq((n) => n + 1);
+    const siteLabel = STORE_NAME[site] || site || "";
+    const newTurn: Turn = {
+      id,
+      query,
+      steps: [],
+      answer: "",
+      offers: [],
+      cartNote: note,
+      cartShot: "",
+      cartSite: siteLabel,
+      error: "",
+      clarifying: false,
+      optionGroups: [],
+      createdAt: Date.now(),
+      responseCreatedAt: Date.now(),
+    };
+    setThreads((prevThreads) => {
+      const nextThreads = prevThreads.map((t) =>
+        t.id === targetThreadId
+          ? { ...t, turns: [...t.turns, newTurn], updatedAt: Date.now() }
+          : t,
+      );
+      threadsRef.current = nextThreads;
+      try {
+        window.localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(nextThreads));
+      } catch {}
+      return nextThreads;
+    });
+    return id;
   }
 
   function patchActiveTurn(id: number, patch: Partial<Turn> | ((prev: Turn) => Turn)) {
@@ -1157,17 +1289,19 @@ export default function CompareDesk() {
                                       <span className="offer-price-na">Check in store</span>
                                     )}
                                     {(() => {
+                                      const key = _addKey(offer);
+                                      const isAdding = addingKeys.has(key);
                                       return (
                                         <button
                                           type="button"
                                           className="quick-add-btn"
-                                          disabled={busy}
+                                          disabled={busy || isAdding}
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            void runAsk(`Add ${offer.title} from ${STORE_NAME[offer.site] || offer.site} to cart`);
+                                            void quickAddToCart(offer);
                                           }}
                                         >
-                                          Add
+                                          {isAdding ? "Adding…" : "Add"}
                                         </button>
                                       );
                                     })()}
@@ -1352,18 +1486,29 @@ export default function CompareDesk() {
             >
               ✕
             </button>
-            <h3 id="cart-drawer-title">My Cart</h3>
-            {cartBusy && <p className="cart-empty">Refreshing live cart…</p>}
-            {!cartBusy && !cart && (
+            <h3 id="cart-drawer-title">
+              My Cart
+              {cartBusy && (
+                <span
+                  aria-live="polite"
+                  style={{ marginLeft: 8, fontSize: 12, fontWeight: 400, opacity: 0.6 }}
+                >
+                  syncing…
+                </span>
+              )}
+            </h3>
+            {!cart && !cartBusy && (
               <p className="cart-empty">
                 Your cart is empty. Search for an item and ask “add to cart”.
               </p>
             )}
-            {!cartBusy && cart && (
+            {!cart && cartBusy && (
+              <p className="cart-empty">Refreshing live cart…</p>
+            )}
+            {cart && (
               <>
                 <p className="cart-meta">
-                  {STORE_NAME[cart.site] || cart.site || "Shop"} ·{" "}
-                  {cart.fulfillment === "pickup" ? "Pickup" : "Delivery"} · Status:{" "}
+                  {cartShopLabel(cart)} · Delivery · Status:{" "}
                   <strong>{cart.status}</strong>
                 </p>
                 {cart.ask_customer_now && cart.missing_fields && cart.missing_fields.length > 0 && (
@@ -1380,40 +1525,45 @@ export default function CompareDesk() {
                   </div>
                 )}
                 <ul className="cart-lines">
-                  {(cart.items || []).map((item, i) => (
-                    <li key={`${item.product_url || item.name}-${i}`}>
-                      <div className="cart-line-photo">
-                        {item.image_url ? (
-                          <img src={item.image_url} alt="" referrerPolicy="no-referrer" />
-                        ) : (
-                          <em>—</em>
-                        )}
-                      </div>
-                      <div className="cart-line-meta">
-                        <strong>{item.name || "Item"}</strong>
-                        <span>
-                          Qty {item.qty ?? 1}
-                          {item.price_sar != null
-                            ? ` · ${Number(item.price_sar).toFixed(2)} SAR`
-                            : ""}
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        className="cart-line-remove"
-                        onClick={() => void removeCartItem(item, i)}
-                        disabled={removingIndex === i}
-                        title={`Remove ${item.name || "item"}`}
-                        aria-label={`Remove ${item.name || "item"}`}
-                      >
-                        {removingIndex === i ? "…" : "Remove"}
-                      </button>
-                    </li>
-                  ))}
+                  {(cart.items || []).map((item, i) => {
+                    const itemImage = item.image_url || (item as any).image || "";
+                    const itemPrice = item.price_sar ?? (item as any).price;
+                    return (
+                      <li key={`${item.product_url || item.name}-${i}`}>
+                        <div className="cart-line-photo">
+                          {itemImage ? (
+                            <img src={itemImage} alt="" referrerPolicy="no-referrer" />
+                          ) : (
+                            <em>—</em>
+                          )}
+                        </div>
+                        <div className="cart-line-meta">
+                          <strong>{item.name || "Item"}</strong>
+                          <span>
+                            {item.site ? `${STORE_NAME[item.site] || item.site} · ` : ""}
+                            Qty {item.qty ?? 1}
+                            {itemPrice != null
+                              ? ` · ${Number(itemPrice).toFixed(2)} SAR`
+                              : ""}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="cart-line-remove"
+                          onClick={() => void removeCartItem(item, i)}
+                          disabled={removingIndex === i}
+                          title={`Remove ${item.name || "item"}`}
+                          aria-label={`Remove ${item.name || "item"}`}
+                        >
+                          {removingIndex === i ? "…" : "Remove"}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
                 {cart.total_sar != null && (
                   <p className="cart-total">
-                    Total: {Number(cart.total_sar).toFixed(2)} SAR · COD
+                    Total: {Number(cart.total_sar).toFixed(2)} SAR · cash to Wish Wish
                   </p>
                 )}
                 <p className="cart-note">
@@ -1484,9 +1634,16 @@ export default function CompareDesk() {
                 disabled={busy}
                 onClick={() => {
                   const title = detail?.title || openOffer.title;
-                  const site = STORE_NAME[openOffer.site] || openOffer.site;
+                  const price = detail?.price_sar ?? openOffer.price_sar;
+                  const image = detail?.image_url || openOffer.image_url;
                   closeDetail();
-                  void runAsk(`Add ${title} from ${site} to cart`);
+                  void quickAddToCart({
+                    site: openOffer.site,
+                    title,
+                    price_sar: price,
+                    url: openOffer.url,
+                    image_url: image,
+                  });
                 }}
               >
                 Add to {STORE_NAME[openOffer.site] || openOffer.site} cart
