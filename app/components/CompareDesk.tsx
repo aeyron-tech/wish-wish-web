@@ -1564,7 +1564,7 @@ export default function CompareDesk() {
                     fontSize: 13,
                     lineHeight: 1.4,
                   }}>
-                    <strong>Still need to finalize:</strong> {cart.missing_fields.join(", ")}. Reply in chat with these details to place the order.
+                    <strong>Still need:</strong> {cart.missing_fields.join(", ")}. Reply in chat with these details.
                   </div>
                 )}
                 <ul className="cart-lines">
@@ -1610,7 +1610,7 @@ export default function CompareDesk() {
                   </p>
                 )}
                 <p className="cart-note">
-                  Order id <code>{cart.id}</code>. Say “place order” in chat once your delivery address is confirmed.
+                  Order id <code>{cart.id}</code>. Delivery details stay saved — checkout isn’t available yet.
                 </p>
                 <button
                   type="button"
